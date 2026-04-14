@@ -43,8 +43,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from learner.config import load_config  # noqa: E402
+from learner.episode_canvas import process_recorded_episode  # noqa: E402
 from learner.events import EventLog  # noqa: E402
-from learner.action_canvas import save_action_canvas  # noqa: E402
 from learner.registry import Registry  # noqa: E402
 
 
@@ -81,7 +81,13 @@ class PhaseTracker:
         self.current_cycle: int = 0
 
     def _latest_session(self) -> Optional[str]:
-        cands = list(self.runs_dir.glob("events_*.jsonl"))
+        # Exclude the worker's own log file — it matches events_*.jsonl
+        # and is constantly rewritten, which would otherwise win the
+        # max-mtime race and hijack `session` into "explore_inference_worker".
+        cands = [
+            p for p in self.runs_dir.glob("events_*.jsonl")
+            if p.name != "events_explore_inference_worker.jsonl"
+        ]
         if not cands:
             return None
         return max(cands, key=lambda p: p.stat().st_mtime).stem.removeprefix("events_")
@@ -250,123 +256,36 @@ def process_episode(
     cycle: int,
     event_log: EventLog,
 ) -> int:
-    """Load one episode, run inference on each action, write probe PNGs.
+    """Load one recorded episode and write one action canvas PNG.
 
-    Returns the number of probes produced.
+    Thin wrapper around `learner.episode_canvas.process_recorded_episode`
+    so both the worker and the learner's VERIFY path go through exactly
+    the same code.
     """
-    _ensure_sibling_paths(cfg)
-    from data.lerobot_loader import LeRobotV3Reader, load_episode  # type: ignore
-    from control.canvas_utils import FRAME_SIZE  # type: ignore
-
-    reader = LeRobotV3Reader(str(cache_dir))
-    cameras = [
-        f"observation.images.{cfg.explore.base_camera_name}",
-        f"observation.images.{cfg.explore.wrist_camera_name}",
-    ]
-    # canvas-world-model's loader strips the "observation.images." prefix
-    # itself; it accepts just the short name. Build both forms — whichever
-    # the video directory layout uses will resolve.
-    short_cameras = [cfg.explore.base_camera_name, cfg.explore.wrist_camera_name]
-
-    episode = None
-    last_err = None
-    for cam_list in (short_cameras, cameras):
-        try:
-            episode = load_episode(
-                reader=reader,
-                episode_index=episode_index,
-                cameras=cam_list,
-                stack_mode="vertical",
-                frame_size=FRAME_SIZE,
-                state_column="observation.state",
-            )
-            break
-        except Exception as e:
-            last_err = e
-            continue
-    if episode is None:
-        event_log.log(
-            "worker_episode_load_failed",
-            episode_index=episode_index,
-            error=str(last_err),
-        )
-        return 0
-
-    if len(episode.actions) == 0 or len(episode.frames) < 2:
-        return 0
-
-    control_idx = _canvas_control_joint_idx(cfg)
-    step_size = float(cfg.robot.step_size)
-
     predictor = predictor_state.predictor
-    n_written = 0
-    for i, action in enumerate(episode.actions):
-        context_frame = episode.frames[i]        # stacked base+wrist
-        actual_frame = episode.frames[i + 1]     # stacked base+wrist
-        motor_state = (
-            episode.motor_positions[i] if episode.motor_positions else None
-        )
-        if motor_state is None:
-            continue
-
-        try:
-            pred_list = predictor.predict_batch(
-                context_frame,
-                motor_state,
-                [int(action)],
-                step_size=step_size,
-                control_joint_idx=control_idx,
-                prediction_depth=1,
-            )
-        except Exception as e:
-            event_log.log(
-                "worker_inference_failed",
-                episode_index=episode_index,
-                decision_index=i,
-                error=str(e),
-            )
-            continue
-        pred_base, pred_wrist = pred_list[0]
-
-        # Split the vertically-stacked context/actual into per-camera views.
-        h = actual_frame.shape[0] // 2
-        before_base = context_frame[:h]
-        before_wrist = context_frame[h:]
-        actual_base = actual_frame[:h]
-        actual_wrist = actual_frame[h:]
-
-        import numpy as np
-        pb = pred_base.astype(np.float32) / 255.0
-        pw = pred_wrist.astype(np.float32) / 255.0
-        ab = actual_base.astype(np.float32) / 255.0
-        aw = actual_wrist.astype(np.float32) / 255.0
-        mse = float(((pb - ab) ** 2).mean() + ((pw - aw) ** 2).mean()) / 2.0
-
-        tag = f"c{cycle:03d}_ep{episode_index:04d}_d{i:02d}_{time.strftime('%H%M%S')}"
-        out_path = examples_dir / f"action_canvas_{tag}.png"
-        save_action_canvas(
-            out_path,
-            cams_before={"base": before_base, "wrist": before_wrist},
-            pred_base=pred_base,
-            pred_wrist=pred_wrist,
-            actual_base=actual_base,
-            actual_wrist=actual_wrist,
-            mse=mse,
-            action=int(action),
-            header_prefix="[worker]",
-        )
-        n_written += 1
-        event_log.log(
-            "worker_probe",
-            cycle=cycle,
-            episode_index=episode_index,
-            decision_index=i,
-            action=int(action),
-            mse=mse,
-            source="lerobot_replay",
-        )
-
-    return n_written
+    if predictor is None:
+        return 0
+    probe = process_recorded_episode(
+        cfg=cfg,
+        cache_dir=cache_dir,
+        episode_index=episode_index,
+        predictor=predictor,
+        examples_dir=examples_dir,
+        cycle=cycle,
+        filename_prefix="ep",
+    )
+    if probe is None:
+        return 0
+    event_log.log(
+        "worker_probe",
+        cycle=cycle,
+        episode_index=episode_index,
+        decision_index=0,
+        action=probe.action,
+        mse=probe.mse,
+        source="lerobot_replay",
+    )
+    return 1
 
 
 # ---------------------------------------------------------------- main
@@ -460,9 +379,15 @@ def main():
                         print(f"[worker] cycle {tracker.current_cycle} episode {idx}: {n} probes")
                 except Exception as e:
                     msg = str(e)
-                    if "Parquet magic bytes" in msg or "magic bytes not found" in msg:
-                        # Race: chunk still being flushed. Don't mark as
-                        # processed — let the next tick retry.
+                    transient = (
+                        "Parquet magic bytes" in msg
+                        or "magic bytes not found" in msg
+                        or "Episodes metadata not found" in msg
+                        or "episode metadata" in msg.lower()
+                    )
+                    if transient:
+                        # Race with lerobot recorder's deferred meta flush.
+                        # Don't mark as processed — retry next tick.
                         break
                     worker_log.log(
                         "worker_episode_error",

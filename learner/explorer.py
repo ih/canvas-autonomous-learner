@@ -292,6 +292,9 @@ def collect_batch(
     event_log=None,
     joint_range_override: dict[str, tuple[float, float]] | None = None,
     randomize_primary_start: bool | None = None,
+    probe_script: list[tuple[float, str]] | None = None,
+    repo_id_prefix: str = "auto/autonomous-explore",
+    event_tag: str = "explore_start",
 ) -> Path | None:
     """Run one EXPLORE burst and return the LeRobot v3.0 dataset path.
 
@@ -315,7 +318,7 @@ def collect_batch(
     expected to disconnect its hardware before calling this.
     """
     session = _session_stamp()
-    repo_id = f"auto/autonomous-explore-{session}"
+    repo_id = f"{repo_id_prefix}-{session}"
     dataset_path = _cache_path_for_repo_id(repo_id)
     if dataset_path.exists():
         shutil.rmtree(dataset_path)
@@ -343,6 +346,7 @@ def collect_batch(
         f"--policy.vary_target_joint={'true' if cfg.explore.vary_target_joint else 'false'}",
         f"--policy.position_delta={cfg.robot.step_size}",
         f"--policy.action_duration={cfg.explore.action_duration}",
+        f"--policy.start_buffer={getattr(cfg.explore, 'start_buffer', 2.5)}",
         f"--dataset.repo_id={repo_id}",
         f"--dataset.num_episodes={num_episodes}",
         f"--dataset.fps={cfg.explore.dataset_fps}",
@@ -351,27 +355,42 @@ def collect_batch(
 
     if joint_range_override:
         cmd.append(f"--policy.joint_ranges={_joint_ranges_cli_arg(joint_range_override)}")
+        # When a probe_script is supplied, each episode forces its own
+        # primary start position, so randomize_primary_start MUST be off —
+        # otherwise the policy would discard the forced start.
+        effective_randomize = (
+            False if probe_script is not None else randomize_primary_start
+        )
         cmd.append(
-            f"--policy.randomize_primary_start={'true' if randomize_primary_start else 'false'}"
+            f"--policy.randomize_primary_start={'true' if effective_randomize else 'false'}"
         )
 
+    import json as _json
     # Force the recorder to use the learner's configured home as its
     # starting-positions baseline. Otherwise the recorder reads live
     # Present_Position after the motor bus hand-off, which is wrong if the
     # arm drooped under gravity during the brief torque release.
     home_ns = getattr(cfg.robot, "home", None)
     if home_ns is not None:
-        import json as _json
         home_dict = {k: float(v) for k, v in vars(home_ns).items()}
         cmd.append(f"--starting-positions-json={_json.dumps(home_dict)}")
 
+    if probe_script is not None:
+        # Queue of [start_pos, direction] tuples consumed one per episode.
+        # Used by VERIFY to drive error-weighted probes through the same
+        # recorder pipeline as EXPLORE, so training canvases and verify
+        # canvases come from the same code path.
+        script_list = [[float(p), str(d)] for p, d in probe_script]
+        cmd.append(f"--probe-script-json={_json.dumps(script_list)}")
+
     if event_log is not None:
         event_log.log(
-            "explore_start",
+            event_tag,
             repo_id=repo_id,
             episodes=num_episodes,
             joint_range_override=joint_range_override,
             randomize_primary_start=randomize_primary_start,
+            probe_script=probe_script,
         )
 
     # Stream the recorder's stdout in this thread so we can parse

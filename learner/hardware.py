@@ -91,68 +91,6 @@ class Hardware:
     def execute(self, action: int) -> None:
         self.robot.execute_action(action)
 
-    def goto(
-        self,
-        joint: str,
-        target: float,
-        settle_time: float = 0.5,
-        tolerance: float = 2.0,
-        timeout: float = 2.0,
-    ) -> None:
-        """Move a single joint to an absolute position and wait for settle.
-
-        Used by VERIFY to initialize each probe at an error-weighted
-        starting state within the curriculum's active range. Other joints
-        are held at their current positions (read once, written back
-        unchanged in the goal dict), matching the hold-inactive-joints
-        pattern in `RobotInterface.execute_action`.
-
-        Polls `Present_Position` until within `tolerance` of target or
-        `timeout` elapses, then sleeps `settle_time` to let the motor fully
-        relax into position before the caller's first `observe()`.
-
-        On `DryRunRobotInterface` we just set `_positions[joint]` directly
-        (there's no simulated motion dynamics; the mock is instantaneous).
-        """
-        # Only clamp when moving the primary control joint — joint_min /
-        # joint_max in the config describe that joint's safe range, not
-        # elbow_flex / shoulder_lift / etc. Non-primary callers are
-        # expected to pass safe values (curriculum ranges, home pose).
-        if joint == self.cfg.robot.control_joint:
-            target = float(max(
-                self.cfg.robot.joint_min,
-                min(self.cfg.robot.joint_max, target),
-            ))
-        else:
-            target = float(target)
-
-        if self.dry_run:
-            positions = getattr(self.robot, "_positions", None)
-            if positions is not None:
-                positions[joint] = target
-            return
-
-        bus = getattr(self.robot, "bus", None)
-        if bus is None:
-            raise RuntimeError("robot is not connected (no bus)")
-
-        positions = bus.sync_read("Present_Position")
-        goal = {j: positions[j] for j in self._JOINTS}
-        goal[joint] = target
-        bus.sync_write("Goal_Position", goal)
-
-        deadline = _time.perf_counter() + timeout
-        while _time.perf_counter() < deadline:
-            _time.sleep(0.02)
-            try:
-                current = bus.sync_read("Present_Position").get(joint)
-            except Exception:
-                continue
-            if current is not None and abs(current - target) <= tolerance:
-                break
-        if settle_time > 0:
-            _time.sleep(settle_time)
-
     def goto_home(self, home: dict, settle_time: float = 1.0) -> None:
         """Move all joints to a fixed home pose in one sync_write. Used to
         park the arm before inactive phases (training, termination) so

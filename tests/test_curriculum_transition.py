@@ -123,9 +123,18 @@ def _stub_trio(tmp_path: Path, probe_iter, retrain_results):
     probes = iter(probe_iter)
     results = iter(retrain_results)
 
-    def fake_verify(hw, action, settle_time, examples_dir=None, example_tag=None,
-                    target_joint=None, target_position=None):
-        return next(probes)
+    def fake_verify_batch(
+        cfg_, hardware, window, curriculum, prev_ckpt, cycle,
+        examples_dir, event_log=None, num_probes=None,
+    ):
+        n = int(num_probes or cfg_.cadence.probes_per_verify)
+        out = []
+        for _ in range(n):
+            try:
+                out.append(next(probes))
+            except StopIteration:
+                break
+        return out
 
     def fake_collect(cfg_, n, window=None, event_log=None,
                      joint_range_override=None, randomize_primary_start=None):
@@ -148,7 +157,7 @@ def _stub_trio(tmp_path: Path, probe_iter, retrain_results):
         except StopIteration:
             return None
 
-    return fake_verify, fake_collect, fake_build, fake_retrain, {
+    return fake_verify_batch, fake_collect, fake_build, fake_retrain, {
         "collect_calls": collect_calls,
         "retrain_calls": retrain_calls,
     }
@@ -188,7 +197,7 @@ def test_stage1_to_stage2_transition(tmp_path, monkeypatch):
         probes.append(_probe(1, 0.001, shoulder_pan=0.0, elbow_flex=70.0))
     retrain_results = [_retrain_result(i, tmp_path) for i in range(10)]
     fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
-    monkeypatch.setattr(orchestrator.verifier, "verify_once", fv)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
 
     registry = Registry(cfg.paths.registry_file)
     hw = FakeHardware()
@@ -231,7 +240,7 @@ def test_stage1_explore_pins_secondary_at_center(tmp_path, monkeypatch):
     probes = [_probe(1, 0.05, 0.0), _probe(2, 0.05, 0.0), _probe(3, 0.05, 0.0)]
     retrain_results = [_retrain_result(0, tmp_path, locked_val=0.05)]
     fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
-    monkeypatch.setattr(orchestrator.verifier, "verify_once", fv)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
 
     orchestrator.main_loop(
         cfg, hardware=FakeHardware(),
@@ -294,7 +303,7 @@ def test_stage2_explore_pins_primary_at_full_and_curriculum_on_secondary(tmp_pat
     ]
     retrain_results = [_retrain_result(0, tmp_path, locked_val=0.05)]
     fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
-    monkeypatch.setattr(orchestrator.verifier, "verify_once", fv)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
 
     hw = FakeHardware()
     orchestrator.main_loop(
@@ -314,7 +323,9 @@ def test_stage2_explore_pins_primary_at_full_and_curriculum_on_secondary(tmp_pat
     # elbow_flex narrowed to the stage-2 curriculum range [60, 80]
     assert override["elbow_flex.pos"] == (60.0, 80.0)
 
-    # Hardware.goto should have been called on shoulder_pan (the
-    # primary-pin in stage 2 verify) at some point before the collect.
-    shoulder_gotos = [c for c in hw.goto_calls if c[0] == "shoulder_pan"]
-    assert len(shoulder_gotos) >= 3  # at least one per verify probe
+    # In the unified verify-via-recorder design, per-probe joint
+    # positioning happens inside the recorder subprocess (via the
+    # probe_script queue), not via a direct hw.goto call from the
+    # orchestrator. The assertion above — that `shoulder_pan.pos` was
+    # pinned to its full range in the collect_batch override — is the
+    # state-level invariant we care about for stage 2 verify.

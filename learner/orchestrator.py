@@ -344,68 +344,34 @@ def main_loop(
             # ---------------------------------------------------- VERIFY
             if state == State.VERIFY:
                 active = _active_range(curriculum, cfg)
-                active_joint_idx_for_verify = _active_joint_idx(curriculum, control_joint_idx)
-                active_joint_name_for_verify = _active_joint_name(curriculum, control_joint)
-                successful_probes = 0
-                import random as _rng
-                for probe_idx in range(probes_per_verify):
-                    if stop():
-                        break
+                if stop():
+                    break
 
-                    # Error-driven state pick on the current curriculum joint.
-                    target_pos = explorer.pick_probe_state(
-                        window, active, control_joint_idx=active_joint_idx_for_verify,
-                    )
-
-                    # Reposition the NON-active curriculum joint to a
-                    # uniform-random position inside whatever range EXPLORE
-                    # is currently using for it (primary.full_range in
-                    # stage 2, secondary.pinned_range in stage 1). This
-                    # keeps each probe's motor state inside the same
-                    # distribution the model was just trained on.
-                    if curriculum is not None:
-                        ranges = curriculum.joint_range_override() or {}
-                        active_key = f"{active_joint_name_for_verify}.pos"
-                        for joint_key, (lo, hi) in ranges.items():
-                            if joint_key == active_key:
-                                continue
-                            joint_name = joint_key.replace(".pos", "")
-                            sampled = _rng.uniform(float(lo), float(hi))
-                            try:
-                                hardware.goto(joint_name, sampled)
-                            except Exception as e:
-                                event_log.log(
-                                    "verify_nonactive_goto_failed",
-                                    cycle=cycle, joint=joint_name, error=str(e),
-                                )
-
-                    action = explorer.pick_probe_action(window, candidates)
-                    tag = f"c{cycle:03d}_p{probe_idx}_{time.strftime('%H%M%S')}"
-                    try:
-                        probe = verifier.verify_once(
-                            hardware, action, settle_time,
-                            examples_dir=examples_dir,
-                            example_tag=tag,
-                            target_joint=active_joint_name_for_verify,
-                            target_position=target_pos,
-                        )
-                    except Exception as e:
-                        event_log.log(
-                            "verify_probe_failed",
-                            cycle=cycle, probe_idx=probe_idx, error=str(e),
-                        )
-                        continue
-                    window.add(probe)
-                    successful_probes += 1
-                    event_log.log(
-                        "probe",
+                # Drive all probes through the same recorder pipeline
+                # that EXPLORE uses: one subprocess, N episodes, each
+                # episode forced into its error-weighted (start_pos,
+                # direction) script. Each episode is then replayed
+                # through canvas-world-model's load_episode +
+                # canvas_builder so verify canvases are byte-identical
+                # to training canvases.
+                try:
+                    probes = verifier.verify_batch(
+                        cfg,
+                        hardware=hardware,
+                        window=window,
+                        curriculum=curriculum,
+                        prev_ckpt=prev_ckpt,
                         cycle=cycle,
-                        action=probe.action,
-                        mse=probe.mse,
-                        state_key=probe.state_key,
-                        motor_state=list(probe.motor_state) if probe.motor_state else None,
-                        target_position=float(target_pos),
+                        examples_dir=examples_dir,
+                        event_log=event_log,
+                        num_probes=probes_per_verify,
                     )
+                except Exception as e:
+                    event_log.log("verify_exception", cycle=cycle, error=str(e))
+                    probes = []
+                for probe in probes:
+                    window.add(probe)
+                successful_probes = len(probes)
 
                 # If every probe in the burst failed, we have no fresh
                 # signal — skip the state-machine decision entirely to
@@ -541,18 +507,20 @@ def main_loop(
                 # there on via `lock_inactive_joints: true`.
                 inactive_positions = getattr(cfg.explore, "inactive_joint_positions", None)
                 if inactive_positions is not None:
-                    for joint_name, target in vars(inactive_positions).items() if hasattr(inactive_positions, "__dict__") else dict(inactive_positions).items():
-                        try:
-                            hardware.goto(joint_name, float(target))
-                            event_log.log(
-                                "inactive_joint_parked",
-                                joint=joint_name, target=float(target),
-                            )
-                        except Exception as e:
-                            event_log.log(
-                                "inactive_joint_park_failed",
-                                joint=joint_name, error=str(e),
-                            )
+                    inactive_dict = (
+                        {k: float(v) for k, v in vars(inactive_positions).items()}
+                        if hasattr(inactive_positions, "__dict__")
+                        else {k: float(v) for k, v in dict(inactive_positions).items()}
+                    )
+                    try:
+                        hardware.goto_home(inactive_dict)
+                        event_log.log(
+                            "inactive_joints_parked", positions=inactive_dict,
+                        )
+                    except Exception as e:
+                        event_log.log(
+                            "inactive_joints_park_failed", error=str(e),
+                        )
 
                 # Build the base joint_range_override from the curriculum
                 # state (stage 1 pins secondary at a tight center; stage 2

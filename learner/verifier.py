@@ -1,29 +1,32 @@
-"""Predict -> execute -> compare -> MSE.
+"""VERIFY through the same recorder pipeline as EXPLORE.
 
-Reuses exactly the metric that `canvas-world-model/evaluate.py` already computes
-offline (last-frame visual MSE), so online thresholds and offline val MSE speak
-the same language. Camera frames are resized to the predictor's frame size
-before comparison so dimensionality always matches.
+`verify_batch` plans N error-weighted probes (via explorer.pick_probe_*),
+spawns the recorder subprocess with a probe_script that forces each
+episode's starting position + direction, disconnects / reconnects the
+motor bus around the subprocess, then replays each recorded episode
+through `episode_canvas.process_recorded_episode` to compute MSE and
+write a training-format action canvas.
+
+This is the only remaining verification path. The old live-camera
+`verify_once` helper was removed because its before/after frames and
+motor-state sampling did not match the canvas-world-model training
+distribution (different orientation, different sampling timing, no
+motor strip encoding, no action separator), which meant verification
+MSE was measuring something other than what the model was trained on.
 """
 
 from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Optional
 
-import cv2
 import numpy as np
 
-from .metrics import ProbeResult
-from .action_canvas import save_action_canvas as _save_action_canvas_shared
-
-
-class _HardwareLike(Protocol):
-    def observe(self): ...
-    def predict(self, ctx, motor, action): ...
-    def execute(self, action: int) -> None: ...
-    def goto(self, joint: str, target: float) -> None: ...
+from . import explorer
+from .episode_canvas import process_recorded_episode
+from .metrics import ProbeResult, RollingWindow
+from .range_tracker import CurriculumState
 
 
 def quantize_motor(motor_state: np.ndarray, bin_size: float = 10.0) -> str:
@@ -32,71 +35,147 @@ def quantize_motor(motor_state: np.ndarray, bin_size: float = 10.0) -> str:
     return ",".join(str(b) for b in bins.tolist())
 
 
-def _to_frame_size(frame: np.ndarray, target_hw: tuple[int, int]) -> np.ndarray:
-    h, w = target_hw
-    if frame.shape[0] == h and frame.shape[1] == w:
-        return frame
-    return cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+_ACTION_TO_DIRECTION = {1: "positive", 2: "negative", 3: "none"}
 
 
-def _mse(pred: np.ndarray, actual: np.ndarray) -> float:
-    p = pred.astype(np.float32) / 255.0
-    a = actual.astype(np.float32) / 255.0
-    return float(((p - a) ** 2).mean())
+def _plan_probe_script(
+    cfg,
+    window: RollingWindow,
+    curriculum: Optional[CurriculumState],
+    num_probes: int,
+) -> list[tuple[float, str]]:
+    """Pick (start_pos, direction) tuples using the same error-weighted
+    selection today's live verifier uses, but returning a script the
+    recorder subprocess consumes one-per-episode instead of placing the
+    arm directly."""
+    control_joint = cfg.robot.control_joint
 
+    if curriculum is not None:
+        active = tuple(curriculum.active_range)
+        active_joint_name = curriculum.active_joint_name
+        active_joint_idx = curriculum.active_joint_idx
+    else:
+        active = (float(cfg.robot.joint_min), float(cfg.robot.joint_max))
+        active_joint_name = control_joint
+        _ensure_sibling = getattr(cfg.paths, "canvas_robot_control", None)
+        import sys
+        if _ensure_sibling and str(_ensure_sibling) not in sys.path:
+            sys.path.insert(0, str(_ensure_sibling))
+        from control.robot_interface import JOINTS  # type: ignore
+        active_joint_idx = JOINTS.index(control_joint)
 
-_save_action_canvas = _save_action_canvas_shared
+    candidates = list(cfg.actions.candidates)
 
-
-def verify_once(
-    hw: _HardwareLike,
-    action: int,
-    settle_time: float,
-    examples_dir: Optional[Path] = None,
-    example_tag: Optional[str] = None,
-    target_joint: Optional[str] = None,
-    target_position: Optional[float] = None,
-) -> ProbeResult:
-    """Execute one verify probe.
-
-    If `target_joint` + `target_position` are both set, the probe starts by
-    calling `hw.goto(target_joint, target_position)` — used by the curriculum
-    to place the arm at an error-weighted starting state before observing.
-    Otherwise the probe starts at whatever position the arm is currently
-    at (legacy behavior).
-    """
-    if target_joint is not None and target_position is not None:
-        hw.goto(target_joint, float(target_position))
-
-    cams_before, motor_before, ctx = hw.observe()
-    pred_base, pred_wrist = hw.predict(ctx, motor_before, action)
-
-    hw.execute(action)
-    if settle_time > 0:
-        time.sleep(settle_time)
-
-    cams_after, _, _ = hw.observe()
-
-    target_hw = (pred_base.shape[0], pred_base.shape[1])
-    actual_base = _to_frame_size(cams_after["base"], target_hw)
-    actual_wrist = _to_frame_size(cams_after["wrist"], target_hw)
-
-    mse_base = _mse(pred_base, actual_base)
-    mse_wrist = _mse(pred_wrist, actual_wrist)
-    mse = (mse_base + mse_wrist) / 2.0
-
-    if examples_dir is not None:
-        tag = example_tag or time.strftime("%H%M%S")
-        _save_action_canvas(
-            Path(examples_dir) / f"action_canvas_{tag}.png",
-            cams_before, pred_base, pred_wrist,
-            actual_base, actual_wrist, mse, action,
+    scripts: list[tuple[float, str]] = []
+    for _ in range(num_probes):
+        pos = explorer.pick_probe_state(
+            window, active, control_joint_idx=active_joint_idx,
         )
+        action = explorer.pick_probe_action(window, candidates)
+        direction = _ACTION_TO_DIRECTION.get(int(action), "none")
+        scripts.append((float(pos), direction))
+    return scripts
 
-    return ProbeResult(
-        state_key=quantize_motor(motor_before),
-        action=action,
-        mse=mse,
-        timestamp=time.time(),
-        motor_state=tuple(float(x) for x in motor_before),
-    )
+
+def verify_batch(
+    cfg,
+    hardware,
+    window: RollingWindow,
+    curriculum: Optional[CurriculumState],
+    prev_ckpt: Optional[str],
+    cycle: int,
+    examples_dir: Path,
+    event_log=None,
+    num_probes: Optional[int] = None,
+) -> list[ProbeResult]:
+    """Drive one VERIFY phase through the recorder pipeline.
+
+    Plans `num_probes` error-weighted probe scripts, records them in a
+    single subprocess invocation (same pipeline + canvas format as
+    EXPLORE), then post-processes each episode with
+    `process_recorded_episode` to get an MSE + an action canvas.
+
+    Returns the list of successful probe results in cycle order.
+    """
+    if num_probes is None:
+        num_probes = int(cfg.cadence.probes_per_verify)
+    if num_probes <= 0:
+        return []
+
+    scripts = _plan_probe_script(cfg, window, curriculum, num_probes)
+    if event_log is not None:
+        event_log.log("verify_plan", cycle=cycle, probe_script=scripts)
+
+    # Joint-range override: keep the primary free across the curriculum's
+    # active range (the probe_script will pin each episode's start within
+    # it anyway) but pin non-active curriculum joints to whatever range
+    # the curriculum says EXPLORE uses for them.
+    joint_range_override: dict = {}
+    if curriculum is not None:
+        joint_range_override = dict(curriculum.joint_range_override() or {})
+
+    hardware.disconnect()
+    try:
+        dataset_dir = explorer.collect_batch(
+            cfg,
+            num_probes,
+            window=window,
+            event_log=event_log,
+            joint_range_override=joint_range_override,
+            probe_script=scripts,
+            repo_id_prefix="auto/autonomous-verify",
+            event_tag="verify_record_start",
+        )
+    finally:
+        try:
+            hardware.connect()
+            if prev_ckpt is not None:
+                hardware.load_predictor(prev_ckpt)
+        except Exception as e:
+            if event_log is not None:
+                event_log.log("verify_reconnect_failed", error=str(e))
+
+    if dataset_dir is None:
+        if event_log is not None:
+            event_log.log("verify_record_failed", cycle=cycle)
+        return []
+
+    predictor = getattr(hardware, "predictor", None)
+    if predictor is None:
+        if event_log is not None:
+            event_log.log("verify_no_predictor", cycle=cycle)
+        return []
+
+    probes: list[ProbeResult] = []
+    for probe_idx in range(num_probes):
+        try:
+            probe = process_recorded_episode(
+                cfg,
+                cache_dir=Path(dataset_dir),
+                episode_index=probe_idx,
+                predictor=predictor,
+                examples_dir=examples_dir,
+                cycle=cycle,
+                filename_prefix="p",
+            )
+        except Exception as e:
+            if event_log is not None:
+                event_log.log(
+                    "verify_probe_failed",
+                    cycle=cycle, probe_idx=probe_idx, error=str(e),
+                )
+            continue
+        if probe is None:
+            continue
+        probes.append(probe)
+        if event_log is not None:
+            event_log.log(
+                "probe",
+                cycle=cycle,
+                action=probe.action,
+                mse=probe.mse,
+                state_key=probe.state_key,
+                motor_state=list(probe.motor_state or []),
+                target_position=scripts[probe_idx][0],
+            )
+    return probes

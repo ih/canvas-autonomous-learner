@@ -13,7 +13,7 @@ Covers the nine invariants from the plan:
 9. Accumulated canvas dirs grow by one per cycle and are passed in full
    to retrain_cumulative
 
-All tests stub out verifier.verify_once, explorer.collect_batch,
+All tests stub out verifier.verify_batch, explorer.collect_batch,
 trainer_driver.build_canvases, and trainer_driver.retrain_cumulative so
 no hardware or canvas-world-model subprocess is touched.
 """
@@ -164,9 +164,18 @@ def _stub_trio(tmp_path: Path, probe_iter, retrain_results=None, retrain_hook=No
     probes = iter(probe_iter)
     results = iter(retrain_results or [])
 
-    def fake_verify(hardware, action, settle_time, examples_dir=None, example_tag=None,
-                    target_joint=None, target_position=None):
-        return next(probes)
+    def fake_verify_batch(
+        cfg_, hardware, window, curriculum, prev_ckpt, cycle,
+        examples_dir, event_log=None, num_probes=None,
+    ):
+        n = int(num_probes or cfg_.cadence.probes_per_verify)
+        out = []
+        for _ in range(n):
+            try:
+                out.append(next(probes))
+            except StopIteration:
+                break
+        return out
 
     def fake_collect(cfg_, n, window=None, event_log=None,
                      joint_range_override=None, randomize_primary_start=None):
@@ -201,7 +210,7 @@ def _stub_trio(tmp_path: Path, probe_iter, retrain_results=None, retrain_hook=No
             return None
         return r
 
-    return fake_verify, fake_collect, fake_build, fake_retrain, {
+    return fake_verify_batch, fake_collect, fake_build, fake_retrain, {
         "collect_calls": collect_calls,
         "build_calls": build_calls,
         "retrain_calls": retrain_calls,
@@ -231,7 +240,7 @@ def test_warm_start_high_then_low(tmp_path, monkeypatch):
     ]
     retrain_results = [_default_retrain_result(0, tmp_path, locked_val=0.008)]
     fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
-    monkeypatch.setattr(orchestrator.verifier, "verify_once", fv)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
 
     hw = FakeHardware()
     event_log = EventLog(cfg.paths.runs_dir, session="warm")
@@ -260,7 +269,7 @@ def test_cold_start_first_state_is_explore(tmp_path, monkeypatch):
     ]
     retrain_results = [_default_retrain_result(0, tmp_path, locked_val=0.12)]
     fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
-    monkeypatch.setattr(orchestrator.verifier, "verify_once", fv)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
 
     hw = FakeHardware()
     event_log = EventLog(cfg.paths.runs_dir, session="cold")
@@ -291,7 +300,7 @@ def test_cold_start_cycle1_uses_ft_epochs_and_resumes(tmp_path, monkeypatch):
         _default_retrain_result(1, tmp_path, locked_val=0.10, train_val=0.07),
     ]
     fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
-    monkeypatch.setattr(orchestrator.verifier, "verify_once", fv)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
 
     hw = FakeHardware()
     orchestrator.main_loop(
@@ -322,7 +331,7 @@ def test_dynamic_burst_scales_with_mean_err(tmp_path, monkeypatch):
     ]
     retrain_results = [_default_retrain_result(0, tmp_path, locked_val=0.005)]
     fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
-    monkeypatch.setattr(orchestrator.verifier, "verify_once", fv)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
 
     orchestrator.main_loop(
         cfg, hardware=FakeHardware(),
@@ -359,7 +368,7 @@ def test_range_expands_after_stable_cycles(tmp_path, monkeypatch):
         for i in range(3)
     ]
     fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
-    monkeypatch.setattr(orchestrator.verifier, "verify_once", fv)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
 
     registry = Registry(cfg.paths.registry_file)
     orchestrator.main_loop(
@@ -392,7 +401,7 @@ def test_bad_cycle_resets_stable_streak(tmp_path, monkeypatch):
     ]
     retrain_results = [_default_retrain_result(i, tmp_path, locked_val=0.005) for i in range(3)]
     fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
-    monkeypatch.setattr(orchestrator.verifier, "verify_once", fv)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
 
     registry = Registry(cfg.paths.registry_file)
     orchestrator.main_loop(
@@ -417,7 +426,7 @@ def test_satisfied_at_full_range(tmp_path, monkeypatch):
         _probe(1, 0.001, 10.0), _probe(2, 0.001, -10.0), _probe(3, 0.001, 20.0),
     ]
     fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results=[])
-    monkeypatch.setattr(orchestrator.verifier, "verify_once", fv)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
 
     result = orchestrator.main_loop(
         cfg, hardware=FakeHardware(),
@@ -442,7 +451,7 @@ def test_safety_cap_fires(tmp_path, monkeypatch):
     probes = [_probe(1, 0.05, 0.0) for _ in range(30)]
     retrain_results = [_default_retrain_result(i, tmp_path, locked_val=0.10) for i in range(30)]
     fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
-    monkeypatch.setattr(orchestrator.verifier, "verify_once", fv)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
 
     result = orchestrator.main_loop(
         cfg, hardware=FakeHardware(),
@@ -472,7 +481,7 @@ def test_val_guard_uses_locked_val_mse(tmp_path, monkeypatch):
         # but locked_val=0.08 < 0.10*1.25=0.125 so the locked guard accepts.
     ]
     fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
-    monkeypatch.setattr(orchestrator.verifier, "verify_once", fv)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
 
     registry = Registry(cfg.paths.registry_file)
     orchestrator.main_loop(
@@ -495,7 +504,7 @@ def test_accumulated_canvas_dirs_grow_and_passed_in_full(tmp_path, monkeypatch):
     probes = [_probe(1, 0.05, 0.0) for _ in range(30)]
     retrain_results = [_default_retrain_result(i, tmp_path, locked_val=0.08) for i in range(3)]
     fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
-    monkeypatch.setattr(orchestrator.verifier, "verify_once", fv)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
 
     orchestrator.main_loop(
         cfg, hardware=FakeHardware(),
