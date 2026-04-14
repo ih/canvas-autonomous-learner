@@ -22,7 +22,9 @@ import argparse
 import http.server
 import json
 import socketserver
+import time
 from pathlib import Path
+from typing import Optional
 from urllib.parse import unquote
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -94,7 +96,7 @@ INDEX_HTML = r"""<!doctype html>
   #action-canvas-gallery { display: flex; flex-direction: column; gap: 12px; max-width: 900px; margin: 0 auto; }
   #action-canvas-gallery figure { margin: 0; background: #1d2230; border: 1px solid #232735; border-radius: 4px; padding: 10px; }
   #action-canvas-gallery figure img { width: 100%; display: block; border-radius: 2px; }
-  #action-canvas-gallery figcaption { font-size: 10px; color: var(--muted); margin-top: 4px; text-align: center; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  #action-canvas-gallery figcaption { font-size: 10px; color: var(--muted); margin-top: 4px; font-family: ui-monospace, Menlo, Consolas, monospace; }
   /* `auto-fit` in the main grid already handles reflow across widths,
      so no explicit breakpoint is needed. */
 </style></head><body>
@@ -115,6 +117,13 @@ INDEX_HTML = r"""<!doctype html>
   <div class="card"><b id="m-phase"><span class="phase-pill">—</span></b><span>phase</span></div>
   <div class="card"><b id="m-active-range">—</b><span>active range</span></div>
   <div class="card"><b id="m-arm-a">—</b><span>Arm A target</span></div>
+</div>
+<div class="strip" style="padding-top:6px;padding-bottom:10px;">
+  <div class="card"><b id="m-time-idle">—</b><span>idle time</span></div>
+  <div class="card"><b id="m-time-verify">—</b><span>verify time</span></div>
+  <div class="card"><b id="m-time-explore">—</b><span>explore time</span></div>
+  <div class="card"><b id="m-time-retrain">—</b><span>retrain time</span></div>
+  <div class="card"><b id="m-time-total">—</b><span>total wall time</span></div>
 </div>
 
 <main>
@@ -162,7 +171,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
   <div class="panel full" id="panel-action-canvas-gallery">
-    <h2>Most recent <span id="action-canvas-gallery-n">5</span> action canvases · before | predicted | actual</h2>
+    <h2>Most recent action canvases · training-format (actual above, inferred below)</h2>
     <div id="action-canvas-gallery"><div class="empty">(no action canvases yet)</div></div>
   </div>
 
@@ -705,15 +714,35 @@ function renderTrainingChart(progress, epochsTarget, width, height) {
   </svg>`;
 }
 
+function parseCanvasName(name) {
+  // Verify probes look like   action_canvas_c000_p5_100018.png
+  // Explore replays look like action_canvas_c000_ep0003_d01_100018.png
+  const mEx = name.match(/action_canvas_c(\d+)_ep(\d+)_d(\d+)_/);
+  if (mEx) {
+    return `cycle ${+mEx[1]} · episode ${+mEx[2]} · action ${+mEx[3]}  [EXPLORE]`;
+  }
+  const mPr = name.match(/action_canvas_c(\d+)_p(\d+)_/);
+  if (mPr) {
+    return `cycle ${+mPr[1]} · probe ${+mPr[2]}  [VERIFY]`;
+  }
+  // Legacy probe_*.png fallback
+  return name;
+}
+
 function renderActionCanvasGallery(imageNames) {
   if (!imageNames || !imageNames.length) {
     return '<div class="empty">(no action canvases yet)</div>';
   }
-  return imageNames.map(name => {
+  return imageNames.map((name, i) => {
     const src = "/canvas/" + encodeURIComponent(name) + "?t=" + Date.now();
+    const label = parseCanvasName(name);
+    // Index within the currently-shown gallery window (1 = newest).
     return `<figure>
+      <figcaption style="text-align:left;margin:0 0 6px 0;color:#dfe6f2;font-size:12px;">
+        <b>#${i + 1}</b> <span style="color:var(--muted);">·</span> ${label}
+      </figcaption>
       <img src="${src}" alt="${name}"/>
-      <figcaption>${name}</figcaption>
+      <figcaption style="font-size:10px;opacity:0.55;">${name}</figcaption>
     </figure>`;
   }).join("");
 }
@@ -765,6 +794,24 @@ async function poll() {
     document.getElementById("m-eps").innerHTML =
       `${total} <span style="color:var(--muted);font-size:11px;">(+${this_cycle} cycle)</span>`;
     document.getElementById("m-retrains").textContent = s.retrain_count != null ? s.retrain_count : 0;
+
+    // Stage cumulative wall-clock durations
+    function fmtDur(sec) {
+      if (sec == null || sec < 1) return "—";
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = Math.floor(sec % 60);
+      if (h > 0) return `${h}h ${m}m`;
+      if (m > 0) return `${m}m ${s}s`;
+      return `${s}s`;
+    }
+    const sd = s.stage_durations || {};
+    document.getElementById("m-time-idle").textContent = fmtDur(sd.IDLE);
+    document.getElementById("m-time-verify").textContent = fmtDur(sd.VERIFY);
+    document.getElementById("m-time-explore").textContent = fmtDur(sd.EXPLORE);
+    document.getElementById("m-time-retrain").textContent = fmtDur(sd.RETRAIN);
+    const totalDur = Object.values(sd).reduce((a, b) => a + (Number(b) || 0), 0);
+    document.getElementById("m-time-total").textContent = fmtDur(totalDur);
 
     // --- Explore progress card ---
     const exCard = document.getElementById("m-explore-progress");
@@ -866,16 +913,14 @@ async function poll() {
     }));
     document.getElementById("action-chart").innerHTML = barChart(bars, 500, 200);
 
-    // --- Action canvas gallery (last N canvases across verify+explore) ---
+    // --- Action canvas gallery (training-format, worker-written) ---
     const gallery = document.getElementById("action-canvas-gallery");
-    const galleryImages = (s.latest_action_canvases || []).slice(0, ACTION_CANVAS_GALLERY_SIZE);
-    const topName = galleryImages[0] || "";
-    if (gallery && gallery.getAttribute("data-top") !== topName) {
-      gallery.innerHTML = renderActionCanvasGallery(galleryImages);
-      gallery.setAttribute("data-top", topName);
+    const galleryImgs = (s.latest_action_canvases || []).slice(0, ACTION_CANVAS_GALLERY_SIZE);
+    const galleryTop = galleryImgs[0] || "";
+    if (gallery && gallery.getAttribute("data-top") !== galleryTop) {
+      gallery.innerHTML = renderActionCanvasGallery(galleryImgs);
+      gallery.setAttribute("data-top", galleryTop);
     }
-    const galleryNSpan = document.getElementById("action-canvas-gallery-n");
-    if (galleryNSpan) galleryNSpan.textContent = String(ACTION_CANVAS_GALLERY_SIZE);
 
     // --- Per-cycle probe counter in the MSE card row ---
     const probesCycleEl = document.getElementById("m-probes-cycle");
@@ -1060,6 +1105,34 @@ def _current_phase(events: list[dict]) -> str | None:
             if s:
                 return s
     return None
+
+
+def _stage_durations(events: list[dict]) -> dict:
+    """Sum wall-clock seconds spent in each state across the session.
+
+    Walks `state` events in order and credits the interval between
+    successive transitions to the preceding state. The most recent
+    state is credited up to `now` so counters tick live even while the
+    state hasn't transitioned yet.
+    """
+    totals: dict[str, float] = {}
+    last_state: Optional[str] = None
+    last_t: Optional[float] = None
+    for e in events:
+        if e.get("event") != "state":
+            continue
+        t = float(e.get("t", 0.0) or 0.0)
+        state = str(e.get("state", "?"))
+        if last_state is not None and last_t is not None:
+            totals[last_state] = totals.get(last_state, 0.0) + max(0.0, t - last_t)
+        last_state = state
+        last_t = t
+    if last_state is not None and last_t is not None:
+        # Include ongoing time in the current state up to "now".
+        totals[last_state] = totals.get(last_state, 0.0) + max(
+            0.0, time.time() - last_t
+        )
+    return totals
 
 
 def _experiment_info(events: list[dict]) -> dict:
@@ -1525,6 +1598,7 @@ def build_state_payload(runs_dir: Path) -> dict:
     current_cycle = max(0, int(exp["cycle_count"]) - 1)
     counts = _probe_counts(events, current_cycle)
     action_counts = _explore_action_counts(events, current_cycle)
+    stage_durations = _stage_durations(events)
 
     return {
         "session": session,
@@ -1561,6 +1635,7 @@ def build_state_payload(runs_dir: Path) -> dict:
         "explore": _explore_progress(events),
         "explore_actions": action_counts,
         "joint_state_series": _joint_state_series(events, window=60),
+        "stage_durations": stage_durations,
     }
 
 

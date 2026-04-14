@@ -121,6 +121,12 @@ actions:
 
 explore:
   action_duration: 1.0
+  # Seconds the policy holds at state.clone() before applying the action,
+  # giving the servos time to settle after the between-episode reset move.
+  # 1.0s (the upstream default) leaves visible drift on hold-action canvases
+  # because the shoulder is still tracking into position; 2.5s is deep in
+  # the settled zone.
+  start_buffer: 2.5
   dataset_fps: 10
   policy_joint_name: shoulder_pan.pos
   vary_target_joint: false
