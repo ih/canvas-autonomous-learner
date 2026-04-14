@@ -1,0 +1,56 @@
+# Smoke-test config: short idle, tiny probe batches, points at the real
+# diffusion checkpoint so `--dry-run` exercises WorldModelPredictor for real
+# without touching hardware.
+paths:
+  canvas_world_model: ../canvas-world-model
+  canvas_robot_control: ../canvas-robot-control
+  robotic_foundation_model_tests: ../robotic-foundation-model-tests
+  base_canvas: ../canvas-world-model/local/datasets/single-action-shoulder-pan-700-combined
+  val_dataset: ../canvas-world-model/local/datasets/single-action-shoulder-pan-700-combined
+  live_checkpoint: ../canvas-world-model/local/checkpoints/diff_iter4_wider/best.pth
+  ckpt_dir: ./checkpoints
+  canvas_out: ./datasets/canvas
+  lerobot_out: ./datasets/lerobot
+  runs_dir: ./runs
+  registry_file: ./checkpoints/registry.json
+  python: C:/Projects/pythonenv-lerobot/Scripts/python.exe
+
+robot:
+  port: COM3
+  robot_id: my_so101_follower
+  control_joint: shoulder_pan
+  step_size: 10.0
+  joint_min: -60.0
+  joint_max: 60.0
+  base_camera: 1
+  wrist_camera: 0
+  camera_width: 640
+  camera_height: 480
+  camera_fps: 10
+
+thresholds:
+  tau_low: 0.005
+  tau_high: 0.015
+  val_guard: 1.25
+
+cadence:
+  idle_seconds: 1
+  probes_per_verify: 2
+  window_size: 8
+  settle_time: 0.0
+  explore_batch_size: 2
+  ft_epochs: 1
+
+actions:
+  candidates: [1, 2, 3]
+  probe_weights: null
+
+explore:
+  action_duration: 1.0
+  dataset_fps: 10
+  policy_joint_name: shoulder_pan.pos
+  vary_target_joint: false
+  base_camera_name: base_0_rgb
+  wrist_camera_name: left_wrist_0_rgb
+
+dry_run: true

@@ -1,0 +1,471 @@
+"""Action selection + episode recording for EXPLORE bursts.
+
+v0 action-selection policy: uniform over candidates, with optional bias toward
+the highest-error action in the current window. Recording is a shell-out to
+`run_single_action_record.py` in `robotic-foundation-model-tests` — that script
+is deeply entangled with `lerobot-record`'s CLI, so wrapping it as a subprocess
+is cleaner than replicating its setup. Output goes to the LeRobot v3.0 cache
+under `~/.cache/huggingface/lerobot/<repo_id>` which is what `create_dataset.py`
+already expects.
+"""
+
+from __future__ import annotations
+
+import json
+import random
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Optional
+
+from .metrics import RollingWindow
+
+
+# The recording subprocess uses LeRobot's tqdm progress bars. When an
+# episode finishes, tqdm prints a line like
+#   "Episode 47: 100%|##########| 1/1 [00:00<00:00, 24.28it/s]"
+# Sometimes these get concatenated with the next episode's "Episode 48: 0%"
+# line over a `\r` carriage return. We detect ANY occurrence of
+# "Episode <n>: ... 100%" in a stdout chunk and emit a progress event
+# for that episode number. Deduped on the most recently emitted number.
+_EPISODE_DONE_RE = re.compile(r"Recording episode\s+(\d+)")
+
+# The recorder logs one of these per episode right before execution, e.g.
+#   "Next episode: Move shoulder pan positive by 10.0 units"
+_EPISODE_ACTION_RE = re.compile(
+    r"Next episode:\s*Move\s+(.+?)\s+(positive|negative)\s+by\s+([-\d.]+)\s+units"
+)
+
+# The recorder logs `Reset: commanding {'elbow_flex': 67.5, ...}` at the
+# start of each episode — a clean snapshot of the commanded joint state.
+_RESET_CMD_RE = re.compile(r"Reset(?:\s+retry\s+\d+)?:\s*commanding\s*(\{[^}]*\})")
+
+
+def pick_probe_action(window: RollingWindow, candidates: list[int]) -> int:
+    """Uniform for a cold window; otherwise weight toward high-MSE actions.
+
+    Unseen actions are sampled first so the window has at least one datapoint
+    per action before we start biasing.
+    """
+    if window.is_empty():
+        return random.choice(candidates)
+
+    per_action = window.per_action_mean()
+    unseen = [a for a in candidates if a not in per_action]
+    if unseen:
+        return random.choice(unseen)
+
+    mses = [per_action[a] for a in candidates]
+    total = sum(mses)
+    if total <= 0:
+        return random.choice(candidates)
+    weights = [m / total for m in mses]
+    return random.choices(candidates, weights=weights, k=1)[0]
+
+
+def pick_probe_state(
+    window: RollingWindow,
+    active_range: tuple[float, float],
+    control_joint_idx: int,
+    n_bins: int = 10,
+    rng: Optional[random.Random] = None,
+) -> float:
+    """Pick a target motor position for the next probe, weighted by per-bin MSE.
+
+    Divides `active_range` into `n_bins` equal segments, walks the window's
+    probes whose `motor_state[control_joint_idx]` falls inside the active
+    range, computes mean MSE per bin, and samples a bin with probability
+    proportional to its mean MSE. Unvisited bins get `1.5 × max seen MSE`
+    so they're the hottest — the selector attacks coverage holes first.
+
+    Returns a uniform-random position inside the chosen bin. Cold window
+    or no in-range probes → uniform sample across the whole active range.
+    """
+    rng = rng or random
+    lo, hi = active_range
+    if hi <= lo:
+        return lo
+
+    if window.is_empty():
+        return rng.uniform(lo, hi)
+
+    bin_width = (hi - lo) / n_bins
+    bin_mses: list[list[float]] = [[] for _ in range(n_bins)]
+    for r in window.snapshot():
+        if r.motor_state is None:
+            continue
+        if control_joint_idx >= len(r.motor_state):
+            continue
+        pos = r.motor_state[control_joint_idx]
+        if pos < lo or pos > hi:
+            continue
+        idx = min(n_bins - 1, max(0, int((pos - lo) / bin_width)))
+        bin_mses[idx].append(r.mse)
+
+    if all(not b for b in bin_mses):
+        return rng.uniform(lo, hi)
+
+    max_seen = max((max(b) for b in bin_mses if b), default=1.0)
+    bin_means = [
+        (sum(b) / len(b)) if b else max_seen * 1.5
+        for b in bin_mses
+    ]
+
+    total = sum(bin_means)
+    if total <= 0:
+        return rng.uniform(lo, hi)
+    weights = [m / total for m in bin_means]
+    bin_idx = rng.choices(range(n_bins), weights=weights, k=1)[0]
+    bin_lo = lo + bin_idx * bin_width
+    bin_hi = bin_lo + bin_width
+    return rng.uniform(bin_lo, bin_hi)
+
+
+def plan_explore_sub_bursts(
+    window: RollingWindow,
+    active_range: tuple[float, float],
+    control_joint_idx: int,
+    total_episodes: int,
+    max_sub_bursts: int = 3,
+    min_sub_burst_size: int = 10,
+    n_bins: int = 10,
+    min_sub_burst_width: float = 0.0,
+) -> list[tuple[int, tuple[float, float]]]:
+    """Allocate an EXPLORE burst across the top-K highest-error state bins.
+
+    Returns a list of `(episode_count, (lo, hi))` tuples whose episode
+    counts sum to at most `total_episodes` (may sum to less after the
+    min-sub-burst-size filter). Every sub-range is a bin inside the
+    active range, and the sum of assigned episodes respects the
+    `min_sub_burst_size` floor per sub-burst.
+
+    `min_sub_burst_width` enforces that no sub-burst range is narrower
+    than the given value. Callers pass `2 * position_delta` so that a
+    single_action policy always has room for a valid ±delta step inside
+    the sub-range — otherwise every episode gets flagged as a no-op and
+    `create_dataset.py` crashes with "all actions are no-ops". If the
+    active range is narrower than the min width, the function collapses
+    to a single sub-burst covering the whole active range.
+
+    Cold-start fallback: if the window has no probes whose starting
+    state falls inside the active range (cold window, or right after a
+    curriculum expansion), return a single sub-burst covering the
+    whole active range. Uniform sampling until we have signal.
+    """
+    lo, hi = active_range
+    if hi <= lo or total_episodes <= 0:
+        return []
+
+    if max_sub_bursts <= 1:
+        return [(int(total_episodes), (float(lo), float(hi)))]
+
+    # Cap n_bins so every bin is at least `min_sub_burst_width` wide.
+    # Integer floor on (range_width / min_width) gives the max #bins that
+    # can each honor the width. If we can only fit 1 bin, fall back to a
+    # single sub-burst covering the full active range.
+    range_width = hi - lo
+    if min_sub_burst_width > 0:
+        max_bins_by_width = int(range_width / min_sub_burst_width)
+        if max_bins_by_width < 2:
+            return [(int(total_episodes), (float(lo), float(hi)))]
+        n_bins = min(n_bins, max_bins_by_width)
+        max_sub_bursts = min(max_sub_bursts, max_bins_by_width)
+
+    in_range = [
+        r for r in window.snapshot()
+        if r.motor_state is not None
+        and control_joint_idx < len(r.motor_state)
+        and lo <= r.motor_state[control_joint_idx] <= hi
+    ]
+    if not in_range:
+        return [(int(total_episodes), (float(lo), float(hi)))]
+
+    bin_width = (hi - lo) / n_bins
+    bin_mses: list[list[float]] = [[] for _ in range(n_bins)]
+    for r in in_range:
+        pos = r.motor_state[control_joint_idx]
+        idx = min(n_bins - 1, max(0, int((pos - lo) / bin_width)))
+        bin_mses[idx].append(r.mse)
+
+    max_seen = max((max(b) for b in bin_mses if b), default=1.0)
+    bin_means = [
+        (sum(b) / len(b)) if b else max_seen * 1.5
+        for b in bin_mses
+    ]
+
+    # Top-K bins by mean MSE
+    ranked = sorted(enumerate(bin_means), key=lambda x: -x[1])
+    k = min(max_sub_bursts, n_bins)
+    chosen = ranked[:k]
+    total_weight = sum(w for _, w in chosen)
+    if total_weight <= 0:
+        return [(int(total_episodes), (float(lo), float(hi)))]
+
+    allocations: list[tuple[int, tuple[float, float]]] = []
+    allocated = 0
+    for idx, (bin_idx, weight) in enumerate(chosen):
+        if idx == len(chosen) - 1:
+            n_eps = int(total_episodes) - allocated
+        else:
+            share = int(total_episodes * weight / total_weight)
+            n_eps = max(min_sub_burst_size, share)
+        allocated += n_eps
+        sub_lo = float(lo + bin_idx * bin_width)
+        sub_hi = float(sub_lo + bin_width)
+        allocations.append((n_eps, (sub_lo, sub_hi)))
+
+    # Fix rounding overshoot: if the min-floor padding pushed us over
+    # `total_episodes`, trim the largest sub-burst.
+    overshoot = sum(n for n, _ in allocations) - int(total_episodes)
+    if overshoot > 0:
+        biggest_idx = max(range(len(allocations)), key=lambda i: allocations[i][0])
+        n, r = allocations[biggest_idx]
+        allocations[biggest_idx] = (max(0, n - overshoot), r)
+
+    # Drop any sub-burst below the floor and redistribute its budget to
+    # the nearest remaining sub-burst (or collapse to a single sub-burst
+    # if nothing survives).
+    surviving = [(n, r) for n, r in allocations if n >= min_sub_burst_size]
+    dropped = sum(n for n, _ in allocations if n < min_sub_burst_size)
+    if not surviving:
+        return [(int(total_episodes), (float(lo), float(hi)))]
+    if dropped > 0:
+        n, r = surviving[0]
+        surviving[0] = (n + dropped, r)
+    return surviving
+
+
+def _cache_path_for_repo_id(repo_id: str) -> Path:
+    return Path.home() / ".cache" / "huggingface" / "lerobot" / repo_id
+
+
+def _build_cameras_arg(cfg) -> str:
+    r = cfg.robot
+    base_name = cfg.explore.base_camera_name
+    wrist_name = cfg.explore.wrist_camera_name
+    return (
+        "{ "
+        f"{base_name}: {{type: opencv, index_or_path: {r.base_camera}, "
+        f"width: {r.camera_width}, height: {r.camera_height}, fps: {r.camera_fps}, "
+        "warmup_s: 2, rotation: ROTATE_180, backend: DSHOW}, "
+        f"{wrist_name}: {{type: opencv, index_or_path: {r.wrist_camera}, "
+        f"width: {r.camera_width}, height: {r.camera_height}, fps: {r.camera_fps}, "
+        "warmup_s: 2, rotation: ROTATE_180, backend: DSHOW}"
+        " }"
+    )
+
+
+def _session_stamp() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def _joint_ranges_cli_arg(
+    joint_range_override: dict[str, tuple[float, float]],
+) -> str:
+    """Serialize `joint_range_override` to a Hydra-style single flag value.
+
+    LeRobot/Hydra will unwrap a JSON-ish dict literal for `--policy.joint_ranges=...`.
+    Example output: `{shoulder_pan.pos: [-20.0, 20.0]}`. The policy's
+    `SingleActionConfig.joint_ranges` is a `Dict[str, Tuple[float, float]]`
+    and only the joints we pass will be overridden; unspecified joints
+    keep `DEFAULT_JOINT_RANGES`.
+
+    Uses a compact JSON-ish form without double quotes around keys (Hydra
+    accepts both). If this turns out to misbehave empirically, the
+    fallback is writing a temp YAML file and passing `--config_path`.
+    """
+    items = ", ".join(
+        f"{joint}: [{lo}, {hi}]"
+        for joint, (lo, hi) in joint_range_override.items()
+    )
+    return "{" + items + "}"
+
+
+def collect_batch(
+    cfg,
+    num_episodes: int,
+    window: RollingWindow | None = None,
+    event_log=None,
+    joint_range_override: dict[str, tuple[float, float]] | None = None,
+    randomize_primary_start: bool | None = None,
+) -> Path | None:
+    """Run one EXPLORE burst and return the LeRobot v3.0 dataset path.
+
+    Args:
+        num_episodes: number of episodes to record.
+        joint_range_override: optional dict mapping `"<joint>.pos"` names
+            (e.g. `"shoulder_pan.pos"`) to `(lo, hi)` tuples. When set,
+            passes `--policy.joint_ranges={...}` so the single_action
+            policy constrains its exploration to the narrowed range.
+            Used by the curriculum to collect data in the currently-active
+            state-space slice, and by the sub-bursting planner to target
+            specific hot bins within that slice.
+        randomize_primary_start: whether each episode should start from
+            a fresh uniform-random position inside `joint_range_override`.
+            Default (None): enable iff `joint_range_override` is set —
+            the override implies we care about coverage inside the range,
+            and randomization is how we get it.
+
+    The robot must NOT be connected from another process — `run_single_action_record.py`
+    opens its own FeetechMotorsBus and camera handles, so the orchestrator is
+    expected to disconnect its hardware before calling this.
+    """
+    session = _session_stamp()
+    repo_id = f"auto/autonomous-explore-{session}"
+    dataset_path = _cache_path_for_repo_id(repo_id)
+    if dataset_path.exists():
+        shutil.rmtree(dataset_path)
+
+    rfmt_root = Path(cfg.paths.robotic_foundation_model_tests)
+    script = rfmt_root / "scripts" / "run_single_action_record.py"
+    if not script.exists():
+        raise FileNotFoundError(f"record script not found: {script}")
+
+    python_exe = cfg.paths.python or sys.executable
+    cameras_arg = _build_cameras_arg(cfg)
+
+    if randomize_primary_start is None:
+        randomize_primary_start = joint_range_override is not None
+
+    cmd = [
+        python_exe,
+        str(script),
+        "--robot.type=so101_follower",
+        f"--robot.port={cfg.robot.port}",
+        f"--robot.id={cfg.robot.robot_id}",
+        f"--robot.cameras={cameras_arg}",
+        "--policy.type=single_action",
+        f"--policy.joint_name={cfg.explore.policy_joint_name}",
+        f"--policy.vary_target_joint={'true' if cfg.explore.vary_target_joint else 'false'}",
+        f"--policy.position_delta={cfg.robot.step_size}",
+        f"--policy.action_duration={cfg.explore.action_duration}",
+        f"--dataset.repo_id={repo_id}",
+        f"--dataset.num_episodes={num_episodes}",
+        f"--dataset.fps={cfg.explore.dataset_fps}",
+        "--dataset.push_to_hub=false",
+    ]
+
+    if joint_range_override:
+        cmd.append(f"--policy.joint_ranges={_joint_ranges_cli_arg(joint_range_override)}")
+        cmd.append(
+            f"--policy.randomize_primary_start={'true' if randomize_primary_start else 'false'}"
+        )
+
+    # Force the recorder to use the learner's configured home as its
+    # starting-positions baseline. Otherwise the recorder reads live
+    # Present_Position after the motor bus hand-off, which is wrong if the
+    # arm drooped under gravity during the brief torque release.
+    home_ns = getattr(cfg.robot, "home", None)
+    if home_ns is not None:
+        import json as _json
+        home_dict = {k: float(v) for k, v in vars(home_ns).items()}
+        cmd.append(f"--starting-positions-json={_json.dumps(home_dict)}")
+
+    if event_log is not None:
+        event_log.log(
+            "explore_start",
+            repo_id=repo_id,
+            episodes=num_episodes,
+            joint_range_override=joint_range_override,
+            randomize_primary_start=randomize_primary_start,
+        )
+
+    # Stream the recorder's stdout in this thread so we can parse
+    # "Episode N: 100%" lines and emit `explore_episode_progress` events.
+    # Without this, the learner process blocks for ~10-15 minutes during
+    # each EXPLORE with zero new events — the dashboard looks frozen.
+    # Also pipe "n" into stdin to answer the stale-cache prompt if it
+    # ever re-appears.
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(rfmt_root),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,  # line buffered
+        )
+    except (OSError, FileNotFoundError) as e:
+        if event_log is not None:
+            event_log.log("explore_failed", repo_id=repo_id, error=str(e))
+        return None
+
+    # Answer the stale-cache prompt up front; the subprocess will block
+    # on stdin until it reads something the first time (or we close it).
+    try:
+        if proc.stdin is not None:
+            proc.stdin.write("n\n")
+            proc.stdin.flush()
+            proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+
+    last_emitted_episode: Optional[int] = None
+
+    def _handle_line(line: str) -> None:
+        nonlocal last_emitted_episode
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+        for m in _EPISODE_DONE_RE.finditer(line):
+            ep = int(m.group(1))
+            if last_emitted_episode is not None and ep <= last_emitted_episode:
+                continue
+            last_emitted_episode = ep
+            if event_log is not None:
+                event_log.log(
+                    "explore_episode_progress",
+                    repo_id=repo_id,
+                    episode_index=ep,
+                    total_episodes=int(num_episodes),
+                )
+        for m in _EPISODE_ACTION_RE.finditer(line):
+            if event_log is not None:
+                event_log.log(
+                    "explore_action_taken",
+                    repo_id=repo_id,
+                    joint=m.group(1).strip().replace(" ", "_"),
+                    direction=m.group(2),
+                    magnitude=float(m.group(3)),
+                )
+        for m in _RESET_CMD_RE.finditer(line):
+            try:
+                import ast
+                state = ast.literal_eval(m.group(1))
+                if isinstance(state, dict) and event_log is not None:
+                    event_log.log(
+                        "explore_joint_state",
+                        repo_id=repo_id,
+                        state={str(k): float(v) for k, v in state.items()},
+                    )
+            except (ValueError, SyntaxError):
+                pass
+
+    try:
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            # Universal newlines splits on \n, \r, and \r\n so we see
+            # tqdm updates as they land.
+            line = raw_line.rstrip("\r\n")
+            if line:
+                _handle_line(line)
+    finally:
+        proc.wait()
+
+    if proc.returncode != 0:
+        if event_log is not None:
+            event_log.log("explore_failed", repo_id=repo_id, returncode=proc.returncode)
+        return None
+
+    if not dataset_path.exists():
+        if event_log is not None:
+            event_log.log("explore_missing_output", repo_id=repo_id, expected=str(dataset_path))
+        return None
+
+    if event_log is not None:
+        event_log.log("explore_done", repo_id=repo_id, path=str(dataset_path))
+    return dataset_path

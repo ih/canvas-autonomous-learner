@@ -1,0 +1,141 @@
+# Comparison experiment — Arm B: cold-start autonomous learner with
+# sequential curriculum (shoulder_pan → elbow_flex) and inactive-joint
+# parking to match Arm A's training distribution. Runs until the
+# curriculum is fully satisfied or the safety cap is hit.
+
+paths:
+  canvas_world_model: ../canvas-world-model
+  canvas_robot_control: ../canvas-robot-control
+  robotic_foundation_model_tests: ../robotic-foundation-model-tests
+  base_canvas: null
+  val_dataset: null
+  locked_val_dataset: ../canvas-world-model/local/datasets/locked_val_v1
+  live_checkpoint: null
+  ckpt_dir: ./checkpoints
+  canvas_out: ./datasets/canvas
+  lerobot_out: ./datasets/lerobot
+  runs_dir: ./runs
+  registry_file: ./checkpoints/registry_armB.json
+  python: C:/Projects/pythonenv-lerobot/Scripts/python.exe
+
+robot:
+  port: COM3
+  robot_id: my_so101_follower
+  control_joint: shoulder_pan
+  step_size: 10.0
+  joint_min: -60.0
+  joint_max: 60.0
+  base_camera: 1
+  wrist_camera: 0
+  camera_width: 640
+  camera_height: 480
+  camera_fps: 10
+  # "Home" = physical pose the arm was recorded at the start of the run,
+  # used whenever the arm is inactive (pre-training, idle, pre-shutdown)
+  # to prevent gravity droop. Units: RANGE_M100_100 normalized.
+  home:
+    shoulder_pan: 21.07
+    shoulder_lift: -100.00
+    elbow_flex: 94.92
+    wrist_flex: 31.82
+    wrist_roll: 5.12
+    gripper: 10.13
+
+thresholds:
+  # Tuned against sanity-v2 findings: the model asymptotes around 0.10
+  # locked val on this scene/architecture, so tau_low needs to be
+  # reachable per-stage or the curriculum never advances.
+  tau_low: 0.05                     # within-range verify MSE that counts as "good"
+  tau_high: 0.10                    # above this → EXPLORE more in the active range
+  val_guard: 1.25                   # locked-val MSE guard; reject if new > guard * prev
+  max_consecutive_rejections: 3     # force-swap after 3 rejections in a row
+
+cadence:
+  idle_seconds: 60
+  probes_per_verify: 6              # used by the decision-path mean_in_range gate
+  window_size: 24
+  settle_time: 0.5
+  # Fixed small-batch curation: collect N episodes, train, verify, repeat.
+  # Extract maximum learning from each small batch before paying for more
+  # robot time. Dynamic scaling is disabled by clamping min=max=base.
+  base_explore_batch_size: 20
+  explore_batch_size_min: 20
+  explore_batch_size_max: 20
+  max_sub_bursts: 1                 # single burst — no error-driven splits
+  min_sub_burst_size: 20
+  cold_start_epochs: 300            # sanity showed marginal gain past ~200 epochs
+  ft_epochs: 150
+  early_stop_patience: 30
+  safety_cap_episodes: 1500
+  warmup_cycles: 2                  # first 2 cycles always EXPLORE
+  explore_max_retries: 2
+  explore_retry_backoff: 10.0
+
+# Sequential curriculum (Option B): shoulder_pan first, then elbow_flex.
+range:
+  enabled: true
+  primary:
+    control_joint: shoulder_pan
+    initial_half_width: 15.0        # start at [-15, 15]
+    full_min: -60.0
+    full_max: 60.0
+    expansion_factor: 1.5           # 15 → 22.5 → 33.75 → 50.625 → 60 (4 steps)
+    stable_cycles_required: 1       # advance after 1 good cycle; tau_low gates quality
+
+  secondary:
+    control_joint: elbow_flex
+    # Start tight around elbow's midpoint (70), expand outward.
+    # full_min/max set to Arm A's DOMINANT training distribution
+    # (datasets 2-7 used [50, 90] with step 10; dataset 1's outlier
+    # [70, 100] is <14% of training data, ignored here).
+    initial_half_width: 15.0        # start at [55, 85]
+    full_min: 50.0
+    full_max: 90.0
+    expansion_factor: 1.5           # 15 → 20 (clamped) = full [50, 90]
+    stable_cycles_required: 1       # advance after 1 good cycle
+    pinned_half_width: 2.5          # stage-1 tight elbow band: [67.5, 72.5]
+
+# Training hyperparameters — match Arm A (diff_iter4_wider) exactly so the
+# comparison measures data-curation strategy, not architecture/optimizer.
+training:
+  patch_size: 16
+  embed_dim: 512
+  depth: 12
+  num_heads: 16
+  num_train_timesteps: 1000
+  beta_schedule: cosine
+  prediction_type: sample
+  lr: 3.0e-4
+  weight_decay: 0.01
+  lr_schedule: cosine
+  warmup_epochs: 15
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+  batch_size: 4
+  seed: 42
+  val_ratio: 0.1
+
+actions:
+  candidates: [1, 2, 3]
+  probe_weights: null
+
+explore:
+  action_duration: 1.0
+  dataset_fps: 10
+  policy_joint_name: shoulder_pan.pos
+  vary_target_joint: false
+  base_camera_name: base_0_rgb
+  wrist_camera_name: left_wrist_0_rgb
+
+  # One-shot `hardware.goto` on each inactive joint before every EXPLORE,
+  # holding all non-primary, non-secondary joints at "home" — the actual
+  # robot pose captured at the start of this run. Only primary
+  # (shoulder_pan) and secondary (elbow_flex) change during recording.
+  # Units are RANGE_M100_100 normalized (NOT degrees).
+  inactive_joint_positions:
+    shoulder_lift: -100.00          # home
+    wrist_flex: 31.82               # home
+    wrist_roll: 5.12                # home
+    gripper: 10.13                  # home
+
+dry_run: false

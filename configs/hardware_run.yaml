@@ -1,0 +1,58 @@
+# Bounded real-hardware smoke run: short idle, small probe batches, real SO-101.
+# `--max-iterations 4` on the CLI gives: IDLE -> VERIFY -> IDLE -> VERIFY
+# (two verify bursts, ~8 probes total).
+paths:
+  canvas_world_model: ../canvas-world-model
+  canvas_robot_control: ../canvas-robot-control
+  robotic_foundation_model_tests: ../robotic-foundation-model-tests
+  base_canvas: ../canvas-world-model/local/datasets/single-action-shoulder-pan-700-combined
+  val_dataset: ../canvas-world-model/local/datasets/single-action-shoulder-pan-700-combined
+  live_checkpoint: ../canvas-world-model/local/checkpoints/diff_iter4_wider/best.pth
+  ckpt_dir: ./checkpoints
+  canvas_out: ./datasets/canvas
+  lerobot_out: ./datasets/lerobot
+  runs_dir: ./runs
+  registry_file: ./checkpoints/registry.json
+  python: C:/Projects/pythonenv-lerobot/Scripts/python.exe
+
+robot:
+  port: COM3
+  robot_id: my_so101_follower
+  control_joint: shoulder_pan
+  step_size: 10.0
+  joint_min: -60.0
+  joint_max: 60.0
+  base_camera: 1
+  wrist_camera: 0
+  camera_width: 640
+  camera_height: 480
+  camera_fps: 10
+
+thresholds:
+  # Set very high so the first run never triggers EXPLORE: we want a clean
+  # VERIFY-only trace to report on for the smoke run.
+  tau_low: 0.005
+  tau_high: 1.0
+  val_guard: 1.25
+
+cadence:
+  idle_seconds: 2
+  probes_per_verify: 4
+  window_size: 16
+  settle_time: 0.5
+  explore_batch_size: 5
+  ft_epochs: 1
+
+actions:
+  candidates: [1, 2, 3]
+  probe_weights: null
+
+explore:
+  action_duration: 1.0
+  dataset_fps: 10
+  policy_joint_name: shoulder_pan.pos
+  vary_target_joint: false
+  base_camera_name: base_0_rgb
+  wrist_camera_name: left_wrist_0_rgb
+
+dry_run: false

@@ -1,0 +1,113 @@
+# Short hardware sanity run for the unified loop + sequential curriculum.
+# Tight settings so we can observe: cold-start EXPLORE → RETRAIN → VERIFY
+# → range expansion → stage transition in a short (~30 min) window.
+
+paths:
+  canvas_world_model: ../canvas-world-model
+  canvas_robot_control: ../canvas-robot-control
+  robotic_foundation_model_tests: ../robotic-foundation-model-tests
+  base_canvas: null
+  val_dataset: null
+  locked_val_dataset: ../canvas-world-model/local/datasets/locked_val_v1
+  live_checkpoint: null
+  ckpt_dir: ./checkpoints
+  canvas_out: ./datasets/canvas
+  lerobot_out: ./datasets/lerobot
+  runs_dir: ./runs
+  registry_file: ./checkpoints/registry_sanity.json
+  python: C:/Projects/pythonenv-lerobot/Scripts/python.exe
+
+robot:
+  port: COM3
+  robot_id: my_so101_follower
+  control_joint: shoulder_pan
+  step_size: 10.0
+  joint_min: -60.0
+  joint_max: 60.0
+  base_camera: 1
+  wrist_camera: 0
+  camera_width: 640
+  camera_height: 480
+  camera_fps: 10
+
+thresholds:
+  tau_low: 0.05                     # easy-to-reach for fast iteration
+  tau_high: 0.08
+  val_guard: 1.25
+  max_consecutive_rejections: 3
+
+cadence:
+  idle_seconds: 1
+  probes_per_verify: 4
+  window_size: 16
+  settle_time: 0.5
+  base_explore_batch_size: 25
+  explore_batch_size_min: 10
+  explore_batch_size_max: 25        # tighter for a short run; cycle 0 = 25 eps
+  max_sub_bursts: 2
+  min_sub_burst_size: 10
+  cold_start_epochs: 200
+  ft_epochs: 30
+  early_stop_patience: 20
+  safety_cap_episodes: 200
+  warmup_cycles: 1
+  explore_max_retries: 2
+  explore_retry_backoff: 10.0
+
+# Sequential curriculum — same shape as Arm B but with tight primary
+# curriculum so we can observe the stage transition.
+range:
+  enabled: true
+  primary:
+    control_joint: shoulder_pan
+    initial_half_width: 10.0
+    full_min: -60.0
+    full_max: 60.0
+    expansion_factor: 3.0           # 10 → 30 → 60 (2 expansions to full)
+    stable_cycles_required: 1
+  secondary:
+    control_joint: elbow_flex
+    initial_half_width: 15.0
+    full_min: 50.0
+    full_max: 90.0
+    expansion_factor: 1.5
+    stable_cycles_required: 1
+    pinned_half_width: 2.5
+
+training:
+  patch_size: 16
+  embed_dim: 512
+  depth: 12
+  num_heads: 16
+  num_train_timesteps: 1000
+  beta_schedule: cosine
+  prediction_type: sample
+  lr: 3.0e-4
+  weight_decay: 0.01
+  lr_schedule: cosine
+  warmup_epochs: 10
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+  batch_size: 4
+  seed: 42
+  val_ratio: 0.1
+
+actions:
+  candidates: [1, 2, 3]
+
+explore:
+  action_duration: 1.0
+  dataset_fps: 10
+  policy_joint_name: shoulder_pan.pos
+  vary_target_joint: false
+  base_camera_name: base_0_rgb
+  wrist_camera_name: left_wrist_0_rgb
+
+  # Park the locked inactive joints to Arm A's centers (RANGE_M100_100 units)
+  inactive_joint_positions:
+    shoulder_lift: -83.0
+    wrist_flex: 31.0
+    wrist_roll: 5.6
+    gripper: 5.8
+
+dry_run: false

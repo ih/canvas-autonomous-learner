@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "canvas-autonomous-learner"
+version = "0.1.0"
+description = "Self-directed learning loop for the canvas world model."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pyyaml",
+    "opencv-python",
+    "torch",
+    "pillow",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["learner*"]
