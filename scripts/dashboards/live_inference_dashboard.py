@@ -45,7 +45,7 @@ from urllib.parse import unquote
 import cv2
 import numpy as np
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from learner.config import load_config  # noqa: E402
