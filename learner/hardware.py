@@ -91,6 +91,23 @@ class Hardware:
     def execute(self, action: int) -> None:
         self.robot.execute_action(action)
 
+    def execute_on(self, action: int, joint: str) -> None:
+        """Execute a discrete action on a specific joint (by name).
+
+        Thin pass-through to `RobotInterface.execute_action_on`. Used by the
+        live-inference dashboard to let the operator probe any joint, not
+        just `cfg.robot.control_joint`.
+        """
+        self.robot.execute_action_on(action, joint)
+
+    def relax(self) -> None:
+        """Disable torque on all joints so the arm can be hand-moved."""
+        self.robot.relax()
+
+    def lock(self) -> None:
+        """Re-enable torque at the current pose so the arm holds position."""
+        self.robot.lock()
+
     def goto_home(self, home: dict, settle_time: float = 1.0) -> None:
         """Move all joints to a fixed home pose in one sync_write. Used to
         park the arm before inactive phases (training, termination) so
