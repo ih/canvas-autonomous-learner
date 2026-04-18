@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import explorer, trainer_driver, verifier
+from . import claude_advisor, explorer, trainer_driver, verifier
 from .budget import dynamic_explore_batch_size
 from .events import EventLog
 from .hardware import Hardware
@@ -35,6 +35,7 @@ from .metrics import RollingWindow
 from .plateau import plateau_reached
 from .range_tracker import CurriculumState
 from .registry import Registry
+from .runtime_knobs import RuntimeKnobs
 from .states import State
 
 
@@ -123,13 +124,14 @@ def main_loop(
     _collect_batch=None,
     _build_canvases=None,
     _retrain=None,
+    _run_advisor=None,
 ) -> dict:
     """Run the unified autonomous learner loop.
 
     Returns a dict summarizing the termination reason + final state.
-    Test-only kwargs `_collect_batch` / `_build_canvases` / `_retrain`
-    let `tests/test_state_machine.py` inject fakes without touching
-    hardware or subprocesses.
+    Test-only kwargs `_collect_batch` / `_build_canvases` / `_retrain` /
+    `_run_advisor` let `tests/test_state_machine.py` inject fakes
+    without touching hardware, subprocesses, or Claude.
     """
     shutdown = _Shutdown()
     _install_signal_handlers(shutdown)
@@ -138,6 +140,7 @@ def main_loop(
     if event_log is None:
         event_log = EventLog(cfg.paths.runs_dir)
     examples_dir = Path(cfg.paths.runs_dir) / f"examples_{event_log.session}"
+    events_path = Path(cfg.paths.runs_dir) / f"events_{event_log.session}.jsonl"
 
     if registry is None:
         registry = Registry(cfg.paths.registry_file)
@@ -147,41 +150,27 @@ def main_loop(
     collect_batch = _collect_batch or explorer.collect_batch
     build_canvases = _build_canvases or trainer_driver.build_canvases
     retrain_fn = _retrain or trainer_driver.retrain_cumulative
+    run_advisor = _run_advisor or claude_advisor.run_advisor
 
     # -------------------------------------------------------- config hoists
     control_joint = cfg.robot.control_joint
     control_joint_idx = _control_joint_idx(cfg)
     candidates = list(cfg.actions.candidates)
 
-    tau_low = float(cfg.thresholds.tau_low)
-    tau_high = float(cfg.thresholds.tau_high)
-    val_guard = float(cfg.thresholds.val_guard)
-    max_consecutive_rejections = int(
-        getattr(cfg.thresholds, "max_consecutive_rejections", 3)
+    knobs = RuntimeKnobs.from_cfg(cfg)
+
+    claude_advisor_enabled = bool(
+        getattr(cfg.cadence, "claude_advisor_enabled", True)
     )
-
-    idle_seconds = float(getattr(cfg.cadence, "idle_seconds", 10))
-    # Linear backoff: each consecutive IDLE sleeps `idle_seconds * n`,
-    # reset to 1 on the next EXPLORE or RETRAIN phase.
-    idle_backoff_count = 1
-    # Dashboard "verify now" button writes this file to force an
-    # immediate VERIFY from any IDLE sleep.
-    trigger_verify_file = Path(cfg.paths.runs_dir) / "trigger_verify.flag"
-    probes_per_verify = int(getattr(cfg.cadence, "probes_per_verify", 4))
-    window_size = int(getattr(cfg.cadence, "window_size", 16))
-    settle_time = float(getattr(cfg.cadence, "settle_time", 0.5))
-
-    base_burst = int(getattr(cfg.cadence, "base_explore_batch_size",
-                             getattr(cfg.cadence, "explore_batch_size", 50)))
-    burst_min = int(getattr(cfg.cadence, "explore_batch_size_min", 10))
-    burst_max = int(getattr(cfg.cadence, "explore_batch_size_max", 150))
-    max_sub_bursts = int(getattr(cfg.cadence, "max_sub_bursts", 3))
-    min_sub_burst_size = int(getattr(cfg.cadence, "min_sub_burst_size", 10))
-
-    safety_cap = int(getattr(cfg.cadence, "safety_cap_episodes", 10**9))
-    warmup_cycles = int(getattr(cfg.cadence, "warmup_cycles", 2))
-    explore_max_retries = int(getattr(cfg.cadence, "explore_max_retries", 2))
-    explore_retry_backoff = float(getattr(cfg.cadence, "explore_retry_backoff", 10.0))
+    claude_max_consecutive_retrains = int(
+        getattr(cfg.cadence, "claude_max_consecutive_retrains", 5)
+    )
+    claude_advisor_crash_timeout_s = float(
+        getattr(cfg.cadence, "claude_advisor_crash_timeout_s", 1800.0)
+    )
+    claude_advisor_model = getattr(cfg.cadence, "claude_advisor_model", None)
+    claude_advisor_effort = getattr(cfg.cadence, "claude_advisor_effort", None)
+    scene_ready_flag = Path(cfg.paths.runs_dir) / "scene_ready.flag"
 
     locked_val_dataset = getattr(cfg.paths, "locked_val_dataset", None)
     base_canvas = getattr(cfg.paths, "base_canvas", None)
@@ -249,10 +238,11 @@ def main_loop(
         starting_total_eps=total_eps,
         starting_accumulated_dirs=len(accumulated_dirs),
         active_range=list(_active_range(curriculum, cfg)),
-        safety_cap=safety_cap,
-        warmup_cycles=warmup_cycles,
-        tau_low=tau_low,
-        tau_high=tau_high,
+        safety_cap=knobs.safety_cap,
+        warmup_cycles=knobs.warmup_cycles,
+        tau_low=knobs.tau_low,
+        tau_high=knobs.tau_high,
+        claude_advisor_enabled=claude_advisor_enabled,
     )
 
     hardware.connect()
@@ -271,12 +261,24 @@ def main_loop(
         except Exception as e:
             event_log.log("goto_home_failed", phase="startup", error=str(e))
 
-    window = RollingWindow(window_size)
-    # Cold start: skip the opening IDLE and go straight to EXPLORE.
-    state = State.IDLE if prev_ckpt is not None else State.EXPLORE
+    window = RollingWindow(knobs.window_size)
+    # Everything now enters via THINK. Claude picks the first real state:
+    # warm-start → default_next = VERIFY, cold-start → default_next = EXPLORE.
+    pending_default_next_state: State = (
+        State.VERIFY if prev_ckpt is not None else State.EXPLORE
+    )
+    state = State.THINK if claude_advisor_enabled else pending_default_next_state
     last_verify_mean_err: Optional[float] = None
     iteration = 0
     new_lerobot_dirs: list[Path] = []
+
+    # THINK-phase mutable state
+    pending_explore_overrides: Optional[dict] = None
+    pending_scene_change_description: Optional[str] = None
+    pending_scene_change_requested_at: Optional[float] = None
+    last_scene_change: Optional[dict] = None
+    consecutive_retrains_without_data: int = 0
+    claude_force_cold_start: bool = False
 
     termination = {
         "reason": "unknown",
@@ -311,11 +313,21 @@ def main_loop(
             if max_iterations is not None and iteration >= max_iterations:
                 termination["reason"] = "max_iterations"
                 break
-            if total_eps >= safety_cap:
+            if total_eps >= knobs.safety_cap:
                 termination["reason"] = "safety_cap_hit"
-                event_log.log("safety_cap_hit", total_eps=total_eps, cap=safety_cap)
+                event_log.log(
+                    "safety_cap_hit", total_eps=total_eps, cap=knobs.safety_cap,
+                )
                 break
-            if plateau_reached(registry.locked_val_history()):
+            # Plateau detection — auto-terminate only when the advisor
+            # is disabled. When Claude is in the loop it sees the full
+            # locked_val_history in every THINK context and decides for
+            # itself whether to terminate, tweak knobs, retrain, or
+            # explore differently; an automatic break would yank agency
+            # away from Claude mid-decision.
+            if not claude_advisor_enabled and plateau_reached(
+                registry.locked_val_history()
+            ):
                 termination["reason"] = "plateau_reached"
                 event_log.log("plateau_reached", cycle=cycle)
                 break
@@ -324,26 +336,163 @@ def main_loop(
             _emit_state_event()
 
             # ------------------------------------------------------ IDLE
+            # Human-in-the-loop wait. Claude has decided the physical scene
+            # needs to be rearranged; the learner blocks until the operator
+            # hits "Scene ready" on the dashboard (which writes the flag
+            # file). No timeout — the user may be away.
             if state == State.IDLE:
-                sleep_for = idle_seconds * idle_backoff_count
+                description = pending_scene_change_description or "(no description)"
                 event_log.log(
-                    "idle_sleep",
-                    seconds=sleep_for,
-                    backoff_count=idle_backoff_count,
+                    "claude_scene_change_requested",
+                    cycle=cycle, description=description,
                 )
-                triggered = _sleep_cancelable(sleep_for, stop, trigger_verify_file)
+                # Consume any stale flag left over from a prior request.
+                try:
+                    if scene_ready_flag.exists():
+                        scene_ready_flag.unlink()
+                except OSError:
+                    pass
+
+                acknowledged = _wait_for_scene_ready(scene_ready_flag, stop, event_log)
                 if stop():
                     break
-                if triggered:
-                    event_log.log("idle_interrupted_by_trigger")
-                # Each consecutive IDLE grows the sleep. Reset on EXPLORE/RETRAIN.
-                idle_backoff_count += 1
-                state = State.VERIFY
+                if not acknowledged:
+                    # stop() returned True during the wait — unreachable given
+                    # the check above, but keep the branch defensive.
+                    break
+
+                ack_t = time.time()
+                event_log.log(
+                    "scene_ready_acknowledged",
+                    cycle=cycle,
+                    description=description,
+                    requested_at=pending_scene_change_requested_at,
+                    acknowledged_at=ack_t,
+                )
+                last_scene_change = {
+                    "description": description,
+                    "requested_at": pending_scene_change_requested_at,
+                    "acknowledged_at": ack_t,
+                }
+                pending_scene_change_description = None
+                pending_scene_change_requested_at = None
+                consecutive_retrains_without_data = 0
+                # After the human acks, bounce back through THINK so Claude
+                # can re-evaluate with the scene updated.
+                pending_default_next_state = State.VERIFY
+                state = State.THINK
+                continue
+
+            # ------------------------------------------------------ THINK
+            # Claude-in-the-loop: spawn `claude -p`, parse its decision,
+            # apply overrides, route to the next state. Fail-open to the
+            # orchestrator's default next state if anything goes wrong.
+            if state == State.THINK:
+                default_next_state = pending_default_next_state
+                default_next_tok = default_next_state.value.lower()
+
+                if not claude_advisor_enabled:
+                    state = default_next_state
+                    continue
+
+                context = claude_advisor.snapshot_run_context(
+                    events_path, registry, cfg, knobs, curriculum,
+                    default_next_state=default_next_tok,
+                    consecutive_retrains_without_data=consecutive_retrains_without_data,
+                    claude_max_consecutive_retrains=claude_max_consecutive_retrains,
+                    last_scene_change=last_scene_change,
+                    pending_explore_overrides=pending_explore_overrides,
+                )
+                prompt = claude_advisor.build_think_prompt(context)
+                try:
+                    advice = run_advisor(
+                        prompt,
+                        timeout_s=claude_advisor_crash_timeout_s,
+                        model=claude_advisor_model,
+                        effort=claude_advisor_effort,
+                        default_next_state=default_next_tok,
+                        add_dir=str(Path(cfg.paths.runs_dir).resolve()),
+                        event_log=event_log,
+                    )
+                except Exception as e:
+                    event_log.log("claude_advisor_failed", error=str(e))
+                    advice = claude_advisor._fail_open(default_next_tok)
+
+                event_log.log("claude_think", cycle=cycle, advice=advice)
+
+                # 1. Runtime knob overrides.
+                applied = knobs.apply_overrides(
+                    advice.get("runtime_overrides") or {}, event_log=event_log,
+                )
+                if applied:
+                    event_log.log("claude_runtime_overrides_applied", applied=applied)
+
+                # 2. Curriculum overrides.
+                c_ov = advice.get("curriculum_overrides") or {}
+                if c_ov and curriculum is not None:
+                    applied = claude_advisor.apply_curriculum_overrides(
+                        curriculum, c_ov, event_log=event_log,
+                    )
+                    if applied:
+                        registry.save_range_state(curriculum.to_registry_snapshot())
+                        event_log.log(
+                            "claude_curriculum_overrides_applied", applied=applied,
+                        )
+
+                # 3. Training hyperparameter overrides.
+                applied = claude_advisor.apply_cfg_overrides(
+                    cfg, advice.get("training_overrides") or {},
+                    event_log=event_log,
+                )
+                if applied:
+                    event_log.log("claude_training_overrides_applied", applied=applied)
+
+                # 4. Explore overrides — stashed for the EXPLORE branch.
+                ex_ov = advice.get("explore_overrides") or {}
+                if ex_ov:
+                    pending_explore_overrides = dict(ex_ov)
+                    event_log.log(
+                        "claude_explore_overrides_pending", overrides=ex_ov,
+                    )
+
+                # 5. Cold-start flag.
+                if advice.get("from_scratch"):
+                    claude_force_cold_start = True
+
+                # 6. Route — apply cap + scene-description check.
+                scene_desc = advice.get("scene_change_description")
+                requested = advice.get("next_state", default_next_tok)
+                canonical = claude_advisor.resolve_next_state(
+                    requested, default_next_tok,
+                    consecutive_retrains_without_data,
+                    claude_max_consecutive_retrains,
+                    has_scene_description=bool(scene_desc),
+                    event_log=event_log,
+                )
+
+                if canonical == "terminate":
+                    termination["reason"] = "claude_terminate"
+                    termination["reason_detail"] = str(advice.get("reason", ""))
+                    break
+
+                if canonical == "retrain":
+                    new_lerobot_dirs = []
+                    consecutive_retrains_without_data += 1
+                    state = State.RETRAIN
+                elif canonical == "idle":
+                    pending_scene_change_description = str(scene_desc or "")
+                    pending_scene_change_requested_at = time.time()
+                    state = State.IDLE
+                elif canonical == "explore":
+                    state = State.EXPLORE
+                else:  # "verify"
+                    state = State.VERIFY
                 continue
 
             # ---------------------------------------------------- VERIFY
             if state == State.VERIFY:
                 active = _active_range(curriculum, cfg)
+                consecutive_retrains_without_data = 0
                 if stop():
                     break
 
@@ -364,7 +513,7 @@ def main_loop(
                         cycle=cycle,
                         examples_dir=examples_dir,
                         event_log=event_log,
-                        num_probes=probes_per_verify,
+                        num_probes=knobs.probes_per_verify,
                     )
                 except Exception as e:
                     event_log.log("verify_exception", cycle=cycle, error=str(e))
@@ -375,11 +524,12 @@ def main_loop(
 
                 # If every probe in the burst failed, we have no fresh
                 # signal — skip the state-machine decision entirely to
-                # avoid acting on stale window data. Go to IDLE and try
-                # again later.
+                # avoid acting on stale window data. Bounce through
+                # THINK so Claude can decide what to do.
                 if successful_probes == 0:
                     event_log.log("verify_burst_empty", cycle=cycle)
-                    state = State.IDLE
+                    pending_default_next_state = State.VERIFY
+                    state = State.THINK
                     continue
 
                 # Only count probes whose start state landed inside the
@@ -398,15 +548,17 @@ def main_loop(
                     n_in_range=n_in_range,
                     n_total=len(window),
                     active_range=list(active),
-                    tau_low=tau_low,
-                    tau_high=tau_high,
+                    tau_low=knobs.tau_low,
+                    tau_high=knobs.tau_high,
                 )
 
-                # Decide next state
-                if cycle < warmup_cycles:
-                    # Warmup: always explore regardless of verify MSE.
-                    state = State.EXPLORE
-                elif mean_err < tau_low:
+                # Compute the *default* next state the way the legacy
+                # tau-gated logic would. Claude sees this in the THINK
+                # context and can override it.
+                default_next = State.VERIFY
+                if cycle < knobs.warmup_cycles:
+                    default_next = State.EXPLORE
+                elif mean_err < knobs.tau_low:
                     if curriculum is not None:
                         curriculum.good_cycle()
                         registry.save_range_state(curriculum.to_registry_snapshot())
@@ -423,9 +575,8 @@ def main_loop(
                                 joint=curriculum.active_joint_name,
                                 old_range=list(old), new_range=list(new_range),
                             )
-                            state = State.EXPLORE
+                            default_next = State.EXPLORE
                         elif curriculum.should_transition_to_secondary():
-                            # Primary is at max + stable; graduate to stage 2.
                             old_stage = curriculum.stage
                             new_tracker = curriculum.transition_to_secondary()
                             registry.save_range_state(curriculum.to_registry_snapshot())
@@ -437,7 +588,7 @@ def main_loop(
                                 new_joint=new_tracker.control_joint,
                                 new_active_range=list(new_tracker.active),
                             )
-                            state = State.EXPLORE
+                            default_next = State.EXPLORE
                         elif curriculum.is_done():
                             termination["reason"] = "satisfied_at_full_curriculum"
                             event_log.log(
@@ -447,27 +598,42 @@ def main_loop(
                             )
                             break
                         else:
-                            state = State.IDLE
-                    else:
-                        state = State.IDLE
-                elif mean_err > tau_high:
+                            default_next = State.VERIFY
+                elif mean_err > knobs.tau_high:
                     if curriculum is not None:
                         curriculum.bad_cycle()
                         registry.save_range_state(curriculum.to_registry_snapshot())
-                    state = State.EXPLORE
-                else:
-                    state = State.IDLE
+                    default_next = State.EXPLORE
+
+                pending_default_next_state = default_next
+                state = State.THINK if claude_advisor_enabled else default_next
                 continue
 
             # ---------------------------------------------------- EXPLORE
             if state == State.EXPLORE:
-                idle_backoff_count = 1
-                burst = dynamic_explore_batch_size(
-                    mean_err=last_verify_mean_err,
-                    tau_high=tau_high,
-                    base=base_burst,
-                    lo=burst_min,
-                    hi=burst_max,
+                consecutive_retrains_without_data = 0
+
+                # Consume any Claude-supplied per-call overrides.
+                explore_ov = pending_explore_overrides or {}
+                pending_explore_overrides = None
+                override_burst = explore_ov.get("num_episodes")
+                override_max_sub_bursts = explore_ov.get("max_sub_bursts")
+                override_randomize = explore_ov.get("randomize_primary_start")
+
+                if override_burst is not None:
+                    burst = int(override_burst)
+                else:
+                    burst = dynamic_explore_batch_size(
+                        mean_err=last_verify_mean_err,
+                        tau_high=knobs.tau_high,
+                        base=knobs.base_burst,
+                        lo=knobs.burst_min,
+                        hi=knobs.burst_max,
+                    )
+                eff_max_sub_bursts = (
+                    int(override_max_sub_bursts)
+                    if override_max_sub_bursts is not None
+                    else knobs.max_sub_bursts
                 )
                 active = _active_range(curriculum, cfg)
                 active_idx = _active_joint_idx(curriculum, control_joint_idx)
@@ -477,8 +643,8 @@ def main_loop(
                     active,
                     control_joint_idx=active_idx,
                     total_episodes=burst,
-                    max_sub_bursts=max_sub_bursts,
-                    min_sub_burst_size=min_sub_burst_size,
+                    max_sub_bursts=eff_max_sub_bursts,
+                    min_sub_burst_size=knobs.min_sub_burst_size,
                     # Each sub-burst must be wide enough for single_action
                     # to execute a full ±position_delta step without being
                     # flagged as a no-op by its bound-forcing logic.
@@ -536,7 +702,7 @@ def main_loop(
                     burst_override[active_joint_key] = (
                         float(sub_range[0]), float(sub_range[1]),
                     )
-                    for attempt in range(explore_max_retries + 1):
+                    for attempt in range(knobs.explore_max_retries + 1):
                         if home_dict:
                             try:
                                 hardware.goto_home(home_dict)
@@ -550,7 +716,10 @@ def main_loop(
                                 window=window,
                                 event_log=event_log,
                                 joint_range_override=burst_override,
-                                randomize_primary_start=True,
+                                randomize_primary_start=(
+                                    True if override_randomize is None
+                                    else bool(override_randomize)
+                                ),
                             )
                         finally:
                             try:
@@ -569,15 +738,15 @@ def main_loop(
                                     cycle=cycle, sub_idx=sub_idx, attempt=attempt,
                                 )
                             break
-                        if attempt < explore_max_retries:
+                        if attempt < knobs.explore_max_retries:
                             event_log.log(
                                 "explore_retry",
                                 cycle=cycle, sub_idx=sub_idx,
                                 attempt=attempt + 1,
-                                max_attempts=explore_max_retries + 1,
-                                backoff_s=explore_retry_backoff,
+                                max_attempts=knobs.explore_max_retries + 1,
+                                backoff_s=knobs.explore_retry_backoff,
                             )
-                            time.sleep(explore_retry_backoff)
+                            time.sleep(knobs.explore_retry_backoff)
                     if dataset_dir is not None:
                         new_lerobot_dirs.append(Path(dataset_dir))
                         total_eps += int(n_eps)
@@ -592,7 +761,6 @@ def main_loop(
 
             # ---------------------------------------------------- RETRAIN
             if state == State.RETRAIN:
-                idle_backoff_count = 1
                 new_canvas_dirs: list[Path] = []
                 canvas_out = Path(cfg.paths.canvas_out)
                 try:
@@ -613,6 +781,10 @@ def main_loop(
                 )
 
                 epochs, from_scratch = _cycle_epochs(cfg, cycle)
+                # Claude-forced cold start overrides cycle 0's auto-cold.
+                if claude_force_cold_start:
+                    from_scratch = True
+                    claude_force_cold_start = False
                 # Park the arm before training so it doesn't sit in whatever
                 # random pose the last episode left it in — keeps the motors
                 # holding a safe pose for the duration of training.
@@ -647,6 +819,41 @@ def main_loop(
                     termination["reason"] = "retrain_failed"
                     break
 
+                # Recoverable training aborts: VRAM pressure, stall, or
+                # hard timeout. Don't terminate — route back to THINK so
+                # Claude can shrink batch_size / architecture and retry.
+                if isinstance(result, dict) and (
+                    result.get("memory_abort")
+                    or result.get("stalled")
+                    or result.get("timeout")
+                ):
+                    if result.get("memory_abort"):
+                        kind = "memory_abort"
+                    elif result.get("stalled"):
+                        kind = "stalled"
+                    else:
+                        kind = "timeout"
+                    event_log.log(
+                        f"retrain_{kind}_routed_to_think",
+                        cycle=cycle,
+                        tag=result.get("tag"),
+                        summary=result.get("summary"),
+                        seconds_since_last_progress=result.get(
+                            "seconds_since_last_progress"
+                        ),
+                        timeout_s=result.get("timeout_s"),
+                    )
+                    registry.append_locked_val(
+                        cycle=cycle, total_eps=total_eps,
+                        locked_val_mse=None, train_val_mse=None, accepted=False,
+                    )
+                    new_lerobot_dirs = []
+                    pending_default_next_state = State.VERIFY
+                    state = (
+                        State.THINK if claude_advisor_enabled else State.VERIFY
+                    )
+                    continue
+
                 train_val_mse = result.get("train_val_mse")
                 locked_val_mse = result.get("locked_val_mse")
                 new_ckpt = result["checkpoint"]
@@ -654,14 +861,14 @@ def main_loop(
                 # Guard: use locked val preferentially; fall back to train val.
                 accepted = True
                 guard_signal = "locked"
-                if cycle < warmup_cycles:
+                if cycle < knobs.warmup_cycles:
                     accepted = True
                 elif prev_locked_val_mse is not None and locked_val_mse is not None:
-                    if locked_val_mse > val_guard * prev_locked_val_mse:
+                    if locked_val_mse > knobs.val_guard * prev_locked_val_mse:
                         accepted = False
                 elif prev_train_val_mse is not None and train_val_mse is not None:
                     guard_signal = "train"
-                    if train_val_mse > val_guard * prev_train_val_mse:
+                    if train_val_mse > knobs.val_guard * prev_train_val_mse:
                         accepted = False
 
                 if accepted:
@@ -694,9 +901,9 @@ def main_loop(
                         locked_val_mse=locked_val_mse,
                         prev_train_val_mse=prev_train_val_mse,
                         prev_locked_val_mse=prev_locked_val_mse,
-                        guard=val_guard, consecutive=rejections,
+                        guard=knobs.val_guard, consecutive=rejections,
                     )
-                    if rejections >= max_consecutive_rejections:
+                    if rejections >= knobs.max_consecutive_rejections:
                         event_log.log(
                             "guard_force_swap",
                             cycle=cycle, consecutive=rejections,
@@ -746,7 +953,13 @@ def main_loop(
 
                 cycle += 1
                 new_lerobot_dirs = []
-                state = State.VERIFY
+                # After every retrain, hand the result to Claude so the
+                # THINK phase can decide whether to retrain again (with
+                # different hparams), verify, explore, or terminate.
+                pending_default_next_state = State.VERIFY
+                state = (
+                    State.THINK if claude_advisor_enabled else State.VERIFY
+                )
                 continue
 
     finally:
@@ -768,26 +981,36 @@ def main_loop(
     return termination
 
 
-def _sleep_cancelable(
-    seconds: float,
+def _wait_for_scene_ready(
+    flag: Path,
     stop: Callable[[], bool],
-    trigger_file: Optional[Path] = None,
+    event_log,
+    heartbeat_s: float = 30.0,
 ) -> bool:
-    """Sleep in short slices so SIGINT doesn't wait out a long idle window.
+    """Block until `flag` appears (dashboard 'Scene ready' button) or
+    `stop()` returns True. Polls in 1s slices so SIGINT stays responsive.
+    Emits `idle_waiting_for_scene_ready` heartbeats every `heartbeat_s`
+    seconds for liveness on the dashboard event stream.
 
-    Returns True if the sleep was cut short by `trigger_file` appearing
-    on disk (dashboard "verify now" button); False otherwise. The file
-    is consumed (deleted) before returning so it can't re-fire.
+    Returns True on acknowledgment, False if stop() fired first. The
+    flag file is deleted on acknowledgment so it can't re-fire a future
+    scene request.
     """
-    end = time.time() + seconds
-    while time.time() < end:
-        if stop():
-            return False
-        if trigger_file is not None and trigger_file.exists():
+    start = time.time()
+    last_heartbeat = start
+    while not stop():
+        if flag.exists():
             try:
-                trigger_file.unlink()
+                flag.unlink()
             except OSError:
                 pass
             return True
-        time.sleep(min(0.5, end - time.time()))
+        now = time.time()
+        if now - last_heartbeat >= heartbeat_s:
+            event_log.log(
+                "idle_waiting_for_scene_ready",
+                elapsed_s=round(now - start, 1),
+            )
+            last_heartbeat = now
+        time.sleep(1.0)
     return False

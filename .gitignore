@@ -11,3 +11,6 @@ __pycache__/
 .env
 *.log
 .claude/
+out.txt
+advisor_test_out.txt
+outputs/

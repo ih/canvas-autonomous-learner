@@ -37,6 +37,24 @@ cadence:
   settle_time: 0.5
   explore_batch_size: 30
   ft_epochs: 3
+  # Kill the training subprocess if no training_progress line arrives
+  # for this long (usually means VRAM saturation has collapsed
+  # throughput). The orchestrator routes back to THINK so Claude can
+  # shrink the config and retry.
+  training_stall_timeout_s: 600
+  # Hard wall-clock ceiling per training invocation, in seconds. 2 h.
+  retrain_timeout_s: 7200
+
+gpu:
+  # Fraction of total VRAM that, sustained, triggers a training abort.
+  # Conservative for a 32 GB RTX 5090 where the last run saturated at
+  # the top of the card.
+  memory_abort_frac: 0.93
+  # Soft warning threshold — logged once per training subprocess when
+  # first crossed so the advisor can see peak pressure.
+  memory_warn_frac: 0.85
+  # How often the background thread polls nvidia-smi, in seconds.
+  sample_interval_s: 5.0
 
 actions:
   # Discrete action ids understood by the world model / policy.

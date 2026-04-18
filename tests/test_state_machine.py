@@ -124,6 +124,12 @@ def _make_cfg(
             warmup_cycles=warmup_cycles,
             explore_max_retries=0,
             explore_retry_backoff=0.0,
+            # Default off for legacy-behavior tests. The Claude-advisor-
+            # specific tests opt in individually.
+            claude_advisor_enabled=False,
+            claude_max_consecutive_retrains=5,
+            claude_advisor_crash_timeout_s=1800.0,
+            claude_advisor_model=None,
         ),
         actions=SimpleNamespace(candidates=[1, 2, 3]),
         explore=SimpleNamespace(
@@ -520,3 +526,376 @@ def test_accumulated_canvas_dirs_grow_and_passed_in_full(tmp_path, monkeypatch):
         if i > 0:
             prev = calls["retrain_calls"][i - 1]["accumulated_canvas_dirs"]
             assert call["accumulated_canvas_dirs"][: len(prev)] == prev
+
+
+# ============================================================================
+# Claude advisor THINK-phase tests (claude_advisor_enabled=True)
+# ============================================================================
+
+
+def _make_advisor_cfg(tmp_path, **kwargs):
+    # Use taus wide enough that mean_err=0.05 sits in the dead zone so
+    # the legacy tau gate default_next is VERIFY, not EXPLORE. The
+    # advisor tests care about whether the advisor's routing takes
+    # effect, not what the default would have been.
+    kwargs.setdefault("tau_low", 0.001)
+    kwargs.setdefault("tau_high", 0.20)
+    cfg = _make_cfg(tmp_path, **kwargs)
+    cfg.cadence.claude_advisor_enabled = True
+    cfg.cadence.claude_max_consecutive_retrains = 5
+    cfg.cadence.claude_advisor_crash_timeout_s = 5.0
+    cfg.cadence.claude_advisor_model = None
+    # Give cfg.training a minimal namespace so apply_cfg_overrides works.
+    cfg.training = SimpleNamespace(
+        lr=3e-4, weight_decay=0.01, warmup_epochs=15,
+        embed_dim=512, depth=12, num_heads=16, patch_size=16,
+        batch_size=4, val_ratio=0.1, seed=42,
+        num_train_timesteps=1000, beta_schedule="cosine",
+        prediction_type="sample", grad_clip=1.0, min_lr=1e-6,
+        lr_schedule="cosine",
+    )
+    return cfg
+
+
+def _scripted_advisor(scripts):
+    """Return a fake `run_advisor` callable that pops one decision per call."""
+    it = iter(scripts)
+
+    def fake(prompt_text, **kwargs):
+        default = kwargs.get("default_next_state", "verify")
+        try:
+            return next(it)
+        except StopIteration:
+            return {"next_state": default, "reason": "script exhausted"}
+    return fake
+
+
+def test_advisor_verify_keeps_default(tmp_path, monkeypatch):
+    cfg = _make_advisor_cfg(tmp_path, warmup_cycles=10)
+    probes = [_probe(1, 0.05, 0.0) for _ in range(30)]
+    retrain_results = [_default_retrain_result(i, tmp_path) for i in range(5)]
+    fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
+
+    advisor = _scripted_advisor([{"next_state": "verify"}] * 10)
+    orchestrator.main_loop(
+        cfg, hardware=FakeHardware(),
+        registry=Registry(cfg.paths.registry_file),
+        event_log=EventLog(cfg.paths.runs_dir, session="advisor_verify"),
+        max_iterations=6,
+        _collect_batch=fc, _build_canvases=fb, _retrain=fr,
+        _run_advisor=advisor,
+    )
+    # Advisor forces verify → no EXPLORE, no retrain called.
+    assert len(calls["collect_calls"]) == 0
+    assert len(calls["retrain_calls"]) == 0
+
+
+def test_advisor_runtime_overrides_patch_knobs(tmp_path, monkeypatch):
+    """runtime_overrides mutate `knobs.*` in place; the change is visible
+    on the next VERIFY."""
+    cfg = _make_advisor_cfg(tmp_path, tau_low=0.10, tau_high=0.20)
+    probes = [_probe(1, 0.05, 0.0) for _ in range(30)]
+    retrain_results = [_default_retrain_result(i, tmp_path) for i in range(5)]
+    fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
+
+    seen_tau_low: list[float] = []
+    real_build = orchestrator.RuntimeKnobs.from_cfg
+    # Wrap to snapshot after any mutation — hook into the event log instead.
+    advisor = _scripted_advisor([
+        {"next_state": "verify",
+         "runtime_overrides": {"tau_low": 0.04, "tau_high": 0.08}},
+        {"next_state": "verify"},
+    ])
+    orchestrator.main_loop(
+        cfg, hardware=FakeHardware(),
+        registry=Registry(cfg.paths.registry_file),
+        event_log=EventLog(cfg.paths.runs_dir, session="advisor_knobs"),
+        max_iterations=4,
+        _collect_batch=fc, _build_canvases=fb, _retrain=fr,
+        _run_advisor=advisor,
+    )
+    # The second verify_summary should reflect the new taus.
+    import json
+    events_file = Path(cfg.paths.runs_dir) / "events_advisor_knobs.jsonl"
+    events = [json.loads(l) for l in events_file.read_text().splitlines() if l.strip()]
+    summaries = [e for e in events if e.get("event") == "verify_summary"]
+    assert summaries, "expected at least one verify_summary"
+    assert summaries[-1]["tau_low"] == 0.04
+    assert summaries[-1]["tau_high"] == 0.08
+
+
+def test_advisor_retrain_routes_to_retrain_with_training_overrides(tmp_path, monkeypatch):
+    cfg = _make_advisor_cfg(tmp_path, cold_start=False, warmup_cycles=0)
+    probes = [_probe(1, 0.05, 0.0) for _ in range(30)]
+    retrain_results = [_default_retrain_result(i, tmp_path) for i in range(5)]
+    fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
+
+    advisor = _scripted_advisor([
+        # First THINK after the warm-start cold boot → ask for a retrain
+        # with a lowered LR.
+        {"next_state": "retrain",
+         "training_overrides": {"training.lr": 1e-5}},
+        # Subsequent THINK calls just verify so the loop winds down.
+        {"next_state": "verify"},
+        {"next_state": "verify"},
+        {"next_state": "verify"},
+    ])
+    orchestrator.main_loop(
+        cfg, hardware=FakeHardware(),
+        registry=Registry(cfg.paths.registry_file),
+        event_log=EventLog(cfg.paths.runs_dir, session="advisor_retrain"),
+        max_iterations=10,
+        _collect_batch=fc, _build_canvases=fb, _retrain=fr,
+        _run_advisor=advisor,
+    )
+    # retrain_fn was called, cfg.training.lr was patched before the call.
+    assert len(calls["retrain_calls"]) >= 1
+    assert cfg.training.lr == 1e-5
+    # No new exploration (new data) before that retrain.
+    assert len(calls["collect_calls"]) == 0
+
+
+def test_advisor_retrain_cap_forces_verify(tmp_path, monkeypatch):
+    cfg = _make_advisor_cfg(tmp_path, cold_start=False, warmup_cycles=0)
+    cfg.cadence.claude_max_consecutive_retrains = 2
+    probes = [_probe(1, 0.05, 0.0) for _ in range(60)]
+    retrain_results = [_default_retrain_result(i, tmp_path) for i in range(20)]
+    fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
+
+    # Always ask to retrain — cap should kick in after 2 consecutive.
+    advisor = _scripted_advisor([{"next_state": "retrain"}] * 20)
+    # 5 iterations: enough for THINK→RETRAIN×2 (counter=2), THINK cap-hit→VERIFY.
+    orchestrator.main_loop(
+        cfg, hardware=FakeHardware(),
+        registry=Registry(cfg.paths.registry_file),
+        event_log=EventLog(cfg.paths.runs_dir, session="advisor_cap"),
+        max_iterations=6,
+        _collect_batch=fc, _build_canvases=fb, _retrain=fr,
+        _run_advisor=advisor,
+    )
+    # Within one cap sequence (no intervening VERIFY reset yet), at
+    # most `cap` retrains before the cap forces verify.
+    assert len(calls["retrain_calls"]) <= 2
+
+    # And the cap-hit event must have been logged.
+    import json
+    events_file = Path(cfg.paths.runs_dir) / "events_advisor_cap.jsonl"
+    events = [json.loads(l) for l in events_file.read_text().splitlines() if l.strip()]
+    assert any(e.get("event") == "claude_retrain_cap_hit" for e in events)
+
+
+def test_advisor_terminate_stops_loop(tmp_path, monkeypatch):
+    cfg = _make_advisor_cfg(tmp_path)
+    probes = [_probe(1, 0.05, 0.0) for _ in range(30)]
+    fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results=[])
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
+
+    advisor = _scripted_advisor([
+        {"next_state": "terminate", "reason": "matched arm A"},
+    ])
+    result = orchestrator.main_loop(
+        cfg, hardware=FakeHardware(),
+        registry=Registry(cfg.paths.registry_file),
+        event_log=EventLog(cfg.paths.runs_dir, session="advisor_terminate"),
+        max_iterations=20,
+        _collect_batch=fc, _build_canvases=fb, _retrain=fr,
+        _run_advisor=advisor,
+    )
+    assert result["reason"] == "claude_terminate"
+    assert len(calls["retrain_calls"]) == 0
+    assert len(calls["collect_calls"]) == 0
+
+
+def test_advisor_failopen_on_exception(tmp_path, monkeypatch):
+    cfg = _make_advisor_cfg(tmp_path, cold_start=False, warmup_cycles=10)
+    probes = [_probe(1, 0.05, 0.0) for _ in range(30)]
+    fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results=[])
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
+
+    def crashing_advisor(prompt_text, **kw):
+        raise RuntimeError("advisor blew up")
+
+    # The loop should still make progress (hit max_iterations).
+    result = orchestrator.main_loop(
+        cfg, hardware=FakeHardware(),
+        registry=Registry(cfg.paths.registry_file),
+        event_log=EventLog(cfg.paths.runs_dir, session="advisor_crash"),
+        max_iterations=4,
+        _collect_batch=fc, _build_canvases=fb, _retrain=fr,
+        _run_advisor=crashing_advisor,
+    )
+    assert result["reason"] in ("max_iterations", "claude_terminate")
+
+
+def test_advisor_idle_routes_with_description(tmp_path, monkeypatch):
+    cfg = _make_advisor_cfg(tmp_path, cold_start=False, warmup_cycles=10)
+    probes = [_probe(1, 0.05, 0.0) for _ in range(30)]
+    fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results=[])
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
+
+    # Stub out the human-ack wait so the test doesn't actually block.
+    def fake_wait(flag, stop, event_log, heartbeat_s=30.0):
+        event_log.log("fake_scene_ready_wait_skipped")
+        return True
+    monkeypatch.setattr(orchestrator, "_wait_for_scene_ready", fake_wait)
+
+    advisor = _scripted_advisor([
+        {"next_state": "idle",
+         "scene_change_description": "move cube left"},
+        {"next_state": "verify"},
+        {"next_state": "verify"},
+    ])
+
+    orchestrator.main_loop(
+        cfg, hardware=FakeHardware(),
+        registry=Registry(cfg.paths.registry_file),
+        event_log=EventLog(cfg.paths.runs_dir, session="advisor_idle"),
+        max_iterations=8,
+        _collect_batch=fc, _build_canvases=fb, _retrain=fr,
+        _run_advisor=advisor,
+    )
+    import json
+    events_file = Path(cfg.paths.runs_dir) / "events_advisor_idle.jsonl"
+    events = [json.loads(l) for l in events_file.read_text().splitlines() if l.strip()]
+    scene_events = [
+        e for e in events if e.get("event") == "claude_scene_change_requested"
+    ]
+    assert scene_events
+    assert "move cube left" in scene_events[-1]["description"]
+    # And the fake wait was actually invoked.
+    assert any(e.get("event") == "fake_scene_ready_wait_skipped" for e in events)
+
+
+def test_advisor_idle_without_description_falls_back(tmp_path, monkeypatch):
+    cfg = _make_advisor_cfg(tmp_path, cold_start=False, warmup_cycles=10)
+    probes = [_probe(1, 0.05, 0.0) for _ in range(30)]
+    fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results=[])
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
+
+    advisor = _scripted_advisor([
+        {"next_state": "idle"},  # missing scene_change_description
+        {"next_state": "verify"},
+    ])
+    result = orchestrator.main_loop(
+        cfg, hardware=FakeHardware(),
+        registry=Registry(cfg.paths.registry_file),
+        event_log=EventLog(cfg.paths.runs_dir, session="advisor_idle_bad"),
+        max_iterations=4,
+        _collect_batch=fc, _build_canvases=fb, _retrain=fr,
+        _run_advisor=advisor,
+    )
+    # Should NOT have blocked on a flag — the loop falls back to the
+    # default next state (VERIFY) and continues.
+    assert result["reason"] in ("max_iterations", "claude_terminate")
+
+
+# ============================================================================
+# Memory-abort / stall routing: recoverable training failures go to THINK
+# ============================================================================
+
+
+def test_memory_abort_routes_to_think_and_does_not_terminate(tmp_path, monkeypatch):
+    """When retrain_fn returns `{"memory_abort": True, ...}`, the
+    orchestrator should NOT set termination["reason"] = "retrain_failed".
+    Instead it should log `retrain_memory_abort_routed_to_think` and
+    hand control to the advisor.
+    """
+    import json
+    cfg = _make_advisor_cfg(tmp_path, cold_start=False, warmup_cycles=0)
+    probes = [_probe(1, 0.5, 0.0) for _ in range(30)]  # high err → explore path
+
+    retrain_calls: list = []
+
+    def fake_retrain(cfg_, accumulated_canvas_dirs, resume_checkpoint, epochs,
+                      locked_val_dataset=None, event_log=None):
+        retrain_calls.append(1)
+        if len(retrain_calls) == 1:
+            return {
+                "memory_abort": True,
+                "tag": "train_diffusion",
+                "summary": {"used_mb": 30720, "total_mb": 32607,
+                            "used_frac": 0.94, "peak_used_mb": 30720},
+                "last_lines": ["epoch 5 started", "..."],
+            }
+        return _default_retrain_result(len(retrain_calls), tmp_path)
+
+    fv, fc, fb, _fr_unused, calls = _stub_trio(tmp_path, probes, retrain_results=[])
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
+
+    # First THINK (post-VERIFY) requests a retrain → retrain returns
+    # memory_abort → orchestrator routes back to THINK → advisor
+    # terminates the run.
+    advisor = _scripted_advisor([
+        {"next_state": "retrain", "reason": "first retrain"},
+        {"next_state": "terminate", "reason": "saw memory_abort, stopping for test"},
+    ])
+
+    session = "advisor_mem_abort"
+    result = orchestrator.main_loop(
+        cfg, hardware=FakeHardware(),
+        registry=Registry(cfg.paths.registry_file),
+        event_log=EventLog(cfg.paths.runs_dir, session=session),
+        max_iterations=6,
+        _collect_batch=fc, _build_canvases=fb, _retrain=fake_retrain,
+        _run_advisor=advisor,
+    )
+    # termination was driven by advisor, not by retrain_failed.
+    assert result["reason"] == "claude_terminate"
+
+    events_file = Path(cfg.paths.runs_dir) / f"events_{session}.jsonl"
+    events = [json.loads(l) for l in events_file.read_text().splitlines() if l.strip()]
+    names = [e.get("event") for e in events]
+    assert "retrain_memory_abort_routed_to_think" in names
+    assert "retrain_failed" not in names  # the generic failure path must not fire
+    # Advisor was called after the abort (THINK was entered).
+    assert "claude_think" in names
+    # The abort entry carries the summary and tag.
+    abort_ev = [e for e in events
+                if e["event"] == "retrain_memory_abort_routed_to_think"][0]
+    assert abort_ev["tag"] == "train_diffusion"
+    assert abort_ev["summary"]["used_frac"] == 0.94
+
+
+def test_stalled_result_routes_to_think(tmp_path, monkeypatch):
+    import json
+    cfg = _make_advisor_cfg(tmp_path, cold_start=False, warmup_cycles=0)
+    probes = [_probe(1, 0.5, 0.0) for _ in range(30)]
+
+    def fake_retrain(cfg_, accumulated_canvas_dirs, resume_checkpoint, epochs,
+                      locked_val_dataset=None, event_log=None):
+        return {
+            "stalled": True,
+            "tag": "train_diffusion",
+            "seconds_since_last_progress": 720.0,
+            "summary": {"used_mb": 29000, "total_mb": 32607, "used_frac": 0.89},
+        }
+
+    fv, fc, fb, _fr_unused, calls = _stub_trio(tmp_path, probes, retrain_results=[])
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
+
+    advisor = _scripted_advisor([
+        {"next_state": "retrain", "reason": "first retrain"},
+        {"next_state": "terminate", "reason": "saw stall"},
+    ])
+
+    session = "advisor_stalled"
+    result = orchestrator.main_loop(
+        cfg, hardware=FakeHardware(),
+        registry=Registry(cfg.paths.registry_file),
+        event_log=EventLog(cfg.paths.runs_dir, session=session),
+        max_iterations=6,
+        _collect_batch=fc, _build_canvases=fb, _retrain=fake_retrain,
+        _run_advisor=advisor,
+    )
+    assert result["reason"] == "claude_terminate"
+    events_file = Path(cfg.paths.runs_dir) / f"events_{session}.jsonl"
+    events = [json.loads(l) for l in events_file.read_text().splitlines() if l.strip()]
+    names = [e.get("event") for e in events]
+    assert "retrain_stalled_routed_to_think" in names
+    stalled_ev = [e for e in events
+                  if e["event"] == "retrain_stalled_routed_to_think"][0]
+    assert stalled_ev["seconds_since_last_progress"] == 720.0

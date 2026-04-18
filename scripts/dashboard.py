@@ -21,7 +21,11 @@ from __future__ import annotations
 import argparse
 import http.server
 import json
+import secrets
 import socketserver
+import subprocess
+import sys as _sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -123,7 +127,26 @@ INDEX_HTML = r"""<!doctype html>
   <div class="card"><b id="m-time-verify">—</b><span>verify time</span></div>
   <div class="card"><b id="m-time-explore">—</b><span>explore time</span></div>
   <div class="card"><b id="m-time-retrain">—</b><span>retrain time</span></div>
+  <div class="card"><b id="m-time-think">—</b><span>think time</span></div>
   <div class="card"><b id="m-time-total">—</b><span>total wall time</span></div>
+</div>
+
+<!-- Scene-change banner: high-contrast card shown only while the learner
+     is in IDLE waiting for a human to rearrange the physical workspace.
+     The big "Scene ready" button POSTs /scene/ready which writes the
+     sentinel flag the orchestrator polls for. -->
+<div id="scene-banner" style="display:none;margin:12px 20px;padding:14px 18px;background:#3a2a12;border:2px solid #f7a072;border-radius:6px;">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">
+    <div>
+      <div style="font-size:11px;text-transform:uppercase;color:#f7a072;letter-spacing:0.5px;margin-bottom:6px;">
+        Scene change requested by Claude
+      </div>
+      <div id="scene-banner-text" style="font-size:15px;color:#fff;line-height:1.4;"></div>
+    </div>
+    <button id="btn-scene-ready" style="background:#f7a072;color:#1a1d27;border:0;padding:10px 22px;border-radius:4px;cursor:pointer;font-size:13px;font-weight:600;white-space:nowrap;">
+      Scene ready
+    </button>
+  </div>
 </div>
 
 <main>
@@ -155,6 +178,46 @@ INDEX_HTML = r"""<!doctype html>
     <div id="explore-actions" style="margin-top:10px;"><div class="empty">(no actions yet)</div></div>
   </div>
 
+  <!-- Training dataset viewer: browse every canvas the model was
+       trained on, batch-by-batch, for spot-checking data quality.
+       "Run inference" re-runs the current live checkpoint on the 3
+       displayed canvases and renders fresh action canvases in the
+       second row beneath. -->
+  <div class="panel full" id="panel-dataset-viewer">
+    <h2>Training dataset viewer
+      <span style="float:right;font-size:11px;color:var(--muted);font-weight:normal;">
+        <select id="dataset-batch" style="background:#1d2230;color:#dfe6f2;border:1px solid #2b3246;padding:3px 6px;font-size:11px;border-radius:3px;">
+          <option value="">(no batches yet)</option>
+        </select>
+        <span id="dataset-info" style="margin-left:10px;"></span>
+        <span id="dataset-pagination" style="margin-left:14px;">
+          <button id="dataset-prev" style="background:#232735;color:#dfe6f2;border:0;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:11px;">‹ prev</button>
+          <span id="dataset-page-label" style="margin:0 6px;">—</span>
+          <button id="dataset-next" style="background:#232735;color:#dfe6f2;border:0;padding:3px 8px;border-radius:3px;cursor:pointer;font-size:11px;">next ›</button>
+        </span>
+        <button id="dataset-infer" style="margin-left:14px;background:#2e9a4f;color:#fff;border:0;padding:3px 10px;border-radius:3px;cursor:pointer;font-size:11px;">Run inference</button>
+      </span>
+    </h2>
+    <div id="dataset-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;">
+      <div class="empty" style="grid-column:1 / -1;">(no training data yet)</div>
+    </div>
+    <div id="dataset-inference-label" style="display:none;font-size:11px;color:var(--muted);margin:14px 0 6px;letter-spacing:0.5px;text-transform:uppercase;">Live-checkpoint inference</div>
+    <div id="dataset-inference-grid" style="display:none;grid-template-columns:repeat(3,1fr);gap:10px;"></div>
+  </div>
+
+  <!-- Claude THINK panel: shows the most recent advisor decision and
+       a rolling history of the last 10. -->
+  <div class="panel full" id="panel-thinking">
+    <h2>Claude THINK · latest decision
+      <span id="thinking-count" style="float:right;font-size:11px;color:var(--muted);font-weight:normal;">0 decisions</span>
+    </h2>
+    <div id="thinking-latest"><div class="empty">(advisor hasn't run yet)</div></div>
+    <details style="margin-top:14px;">
+      <summary style="cursor:pointer;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:0.05em;">History (last 10)</summary>
+      <div id="thinking-history" style="margin-top:10px;"></div>
+    </details>
+  </div>
+
   <!-- Training panel (only rendered when a retrain is in progress or
        recently completed — hidden on cold start before first retrain). -->
   <div class="panel full" id="panel-training" style="display: none;">
@@ -176,9 +239,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
   <div class="panel">
-    <h2>Verification MSE · rolling (last 30 probes)
-      <button id="btn-verify-now" style="float:right;background:#2c7fb8;color:#fff;border:0;padding:4px 10px;border-radius:3px;cursor:pointer;font-size:11px;">Verify now</button>
-    </h2>
+    <h2>Verification MSE · rolling (last 30 probes)</h2>
     <div id="chart"></div>
     <div class="metrics">
       <div class="metric"><b id="m-probes">0</b><span>probes</span></div>
@@ -218,6 +279,12 @@ INDEX_HTML = r"""<!doctype html>
 const POLL_MS = 15000;   // 15 seconds — matches ~14s-per-episode explore rate
 const MAX_EVENTS = 80;
 const ACTION_CANVAS_GALLERY_SIZE = 5;
+const DATASET_PAGE_SIZE = 3;
+const datasetViewerState = {
+  batches: [],
+  selected_index: 0,
+  page: 0,
+};
 
 function fmtMse(v) { return (v == null) ? "—" : v.toFixed(5); }
 function fmtTime(ts) {
@@ -560,6 +627,223 @@ function renderSubBursts(sub) {
   }).join("");
 }
 
+function _nextStateBadge(s) {
+  const colors = {
+    verify:    { bg: "#2a1a3b", fg: "#d18ce5" },
+    explore:   { bg: "#12361e", fg: "#7cd992" },
+    retrain:   { bg: "#3a2a12", fg: "#f7a072" },
+    idle:      { bg: "#3a1212", fg: "#ff6b6b" },
+    terminate: { bg: "#232735", fg: "#8a93a6" },
+  };
+  const c = colors[s] || { bg: "#232735", fg: "#c8cddc" };
+  return `<span style="display:inline-block;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:600;background:${c.bg};color:${c.fg};text-transform:uppercase;letter-spacing:0.05em;">${s || "?"}</span>`;
+}
+
+function _renderOverridesBlock(label, obj) {
+  if (!obj || Object.keys(obj).length === 0) return "";
+  const rows = Object.entries(obj)
+    .map(([k, v]) => `<div style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;color:#c8cddc;padding:2px 0;"><span style="color:var(--muted);">${k}</span> = <span>${JSON.stringify(v)}</span></div>`)
+    .join("");
+  return `<div style="margin-top:8px;">
+    <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:3px;">${label}</div>
+    ${rows}
+  </div>`;
+}
+
+function renderDatasetViewer() {
+  const state = datasetViewerState;
+  const batches = state.batches || [];
+  const select = document.getElementById("dataset-batch");
+  const info = document.getElementById("dataset-info");
+  const grid = document.getElementById("dataset-grid");
+  const pageLabel = document.getElementById("dataset-page-label");
+  const prevBtn = document.getElementById("dataset-prev");
+  const nextBtn = document.getElementById("dataset-next");
+
+  if (!batches.length) {
+    select.innerHTML = '<option value="">(no batches yet)</option>';
+    info.textContent = "";
+    pageLabel.textContent = "—";
+    grid.innerHTML = '<div class="empty">(no training data yet)</div>';
+    prevBtn.disabled = true;
+    nextBtn.disabled = true;
+    return;
+  }
+
+  // Populate the batch <select> (only if the batch list changed).
+  const desiredOptions = batches
+    .map(b => `${b.name} (${b.canvas_count})`)
+    .join("|");
+  if (select.getAttribute("data-key") !== desiredOptions) {
+    select.innerHTML = batches.map((b, i) =>
+      `<option value="${i}">${b.name} · ${b.canvas_count} canvases</option>`
+    ).join("");
+    select.setAttribute("data-key", desiredOptions);
+    if (state.selected_index >= batches.length) state.selected_index = 0;
+  }
+  select.value = String(state.selected_index);
+
+  const batch = batches[state.selected_index] || batches[0];
+  if (!batch) return;
+  const canvases = batch.canvases || [];
+  const totalPages = Math.max(1, Math.ceil(canvases.length / DATASET_PAGE_SIZE));
+  if (state.page >= totalPages) state.page = totalPages - 1;
+  if (state.page < 0) state.page = 0;
+
+  const start = state.page * DATASET_PAGE_SIZE;
+  const end = Math.min(start + DATASET_PAGE_SIZE, canvases.length);
+  const slice = canvases.slice(start, end);
+
+  const metaBits = [];
+  if (batch.meta && batch.meta.canvas_size) metaBits.push(`${batch.meta.canvas_size[0]}×${batch.meta.canvas_size[1]}`);
+  if (batch.mtime) metaBits.push(new Date(batch.mtime * 1000).toLocaleString());
+  info.textContent = metaBits.join(" · ");
+
+  pageLabel.textContent = `${start + 1}–${end} / ${canvases.length}`;
+  prevBtn.disabled = state.page <= 0;
+  nextBtn.disabled = state.page >= totalPages - 1;
+
+  // Stash the current visible batch + slice so the inference button
+  // knows what to ask the server to re-infer.
+  state.current_batch_name = batch.name;
+  state.current_slice = slice.slice();
+
+  // Hide stale inference row whenever the slice changes.
+  const infLabel = document.getElementById("dataset-inference-label");
+  const infGrid = document.getElementById("dataset-inference-grid");
+  const sliceKey = `${batch.name}::${slice.join("|")}`;
+  if (state.last_inference_slice_key !== sliceKey) {
+    infLabel.style.display = "none";
+    infGrid.style.display = "none";
+    infGrid.innerHTML = "";
+  }
+
+  if (!slice.length) {
+    grid.innerHTML = '<div class="empty" style="grid-column:1 / -1;">(empty batch)</div>';
+    return;
+  }
+  grid.innerHTML = slice.map(name => {
+    const src = `/training_canvas/${encodeURIComponent(batch.name)}/${encodeURIComponent(name)}`;
+    return `<figure style="margin:0;background:#1d2230;border:1px solid #232735;border-radius:4px;padding:6px;">
+      <img src="${src}" alt="${name}" style="width:100%;display:block;border-radius:2px;"/>
+      <figcaption style="font-size:10px;color:var(--muted);text-align:center;margin-top:4px;font-family:ui-monospace,Menlo,Consolas,monospace;">${name}</figcaption>
+    </figure>`;
+  }).join("");
+}
+
+async function runDatasetInference() {
+  const state = datasetViewerState;
+  const batchName = state.current_batch_name;
+  const slice = state.current_slice || [];
+  const btn = document.getElementById("dataset-infer");
+  const infLabel = document.getElementById("dataset-inference-label");
+  const infGrid = document.getElementById("dataset-inference-grid");
+  if (!batchName || !slice.length) return;
+
+  const origLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Running…";
+  infLabel.style.display = "block";
+  infLabel.textContent = "Live-checkpoint inference · running…";
+  infGrid.style.display = "grid";
+  infGrid.innerHTML = slice.map(name =>
+    `<figure style="margin:0;background:#1d2230;border:1px solid #232735;border-radius:4px;padding:6px;">
+      <div style="height:160px;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px;">…running on ${escapeHtml(name)}</div>
+    </figure>`
+  ).join("");
+
+  try {
+    const r = await fetch("/api/infer_canvas", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ batch_name: batchName, canvas_names: slice }),
+    });
+    const data = await r.json();
+    if (!r.ok || data.error) {
+      infLabel.textContent = "Live-checkpoint inference · failed";
+      infGrid.innerHTML = `<div class="empty" style="grid-column:1 / -1;color:#ff8a8a;">${escapeHtml(data.error || `HTTP ${r.status}`)}</div>`;
+      return;
+    }
+    const results = data.results || [];
+    const sliceKey = `${batchName}::${slice.join("|")}`;
+    state.last_inference_slice_key = sliceKey;
+    infLabel.textContent = "Live-checkpoint inference";
+    infGrid.innerHTML = results.map(res => {
+      if (res.error) {
+        return `<figure style="margin:0;background:#2a1a1a;border:1px solid #4a2626;border-radius:4px;padding:6px;">
+          <div style="height:160px;display:flex;align-items:center;justify-content:center;color:#ff8a8a;font-size:12px;text-align:center;padding:0 6px;">
+            ${escapeHtml(res.input)}<br/>${escapeHtml(res.error)}
+          </div>
+        </figure>`;
+      }
+      const url = `/on_demand_inference/${encodeURIComponent(res.token)}`;
+      const mseTag = res.mse != null ? `mse=${Number(res.mse).toExponential(2)}` : "";
+      return `<figure style="margin:0;background:#1d2230;border:1px solid #2e9a4f;border-radius:4px;padding:6px;">
+        <img src="${url}" alt="${escapeHtml(res.input)}" style="width:100%;display:block;border-radius:2px;"/>
+        <figcaption style="font-size:10px;color:var(--muted);text-align:center;margin-top:4px;font-family:ui-monospace,Menlo,Consolas,monospace;">${escapeHtml(res.input)} · ${mseTag}</figcaption>
+      </figure>`;
+    }).join("");
+  } catch (e) {
+    infLabel.textContent = "Live-checkpoint inference · failed";
+    infGrid.innerHTML = `<div class="empty" style="grid-column:1 / -1;color:#ff8a8a;">${escapeHtml(String(e))}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origLabel;
+  }
+}
+
+function renderThinkingLatest(entry) {
+  if (!entry || !entry.advice) {
+    return '<div class="empty">(advisor hasn\'t run yet)</div>';
+  }
+  const advice = entry.advice || {};
+  const ts = entry.t ? new Date(entry.t * 1000).toLocaleTimeString() : "";
+  const cycle = entry.cycle != null ? entry.cycle : "?";
+  const next = advice.next_state || "?";
+  const reason = advice.reason || "";
+  return `
+    <div style="display:flex;gap:14px;align-items:flex-start;">
+      <div style="flex:0 0 auto;">${_nextStateBadge(next)}</div>
+      <div style="flex:1 1 auto;">
+        <div style="color:var(--ink);font-size:13px;line-height:1.4;">${escapeHtml(reason)}</div>
+        <div style="color:var(--muted);font-size:10px;margin-top:4px;">cycle ${cycle} · ${ts}</div>
+        ${_renderOverridesBlock("runtime_overrides", advice.runtime_overrides)}
+        ${_renderOverridesBlock("training_overrides", advice.training_overrides)}
+        ${_renderOverridesBlock("curriculum_overrides", advice.curriculum_overrides)}
+        ${_renderOverridesBlock("explore_overrides", advice.explore_overrides)}
+        ${advice.scene_change_description ? `<div style="margin-top:8px;padding:8px 10px;background:#3a2a12;border-left:3px solid #f7a072;font-size:12px;color:#fff;">${escapeHtml(advice.scene_change_description)}</div>` : ""}
+        ${advice.from_scratch ? `<div style="margin-top:8px;font-size:11px;color:#ff6b6b;">⚠ from_scratch=true — next retrain cold-starts</div>` : ""}
+      </div>
+    </div>
+  `;
+}
+
+function renderThinkingHistory(history) {
+  if (!history || !history.length) {
+    return '<div class="empty">(no history yet)</div>';
+  }
+  // Newest first
+  const rows = history.slice().reverse().map(entry => {
+    const advice = entry.advice || {};
+    const ts = entry.t ? new Date(entry.t * 1000).toLocaleTimeString() : "";
+    const next = advice.next_state || "?";
+    const reason = advice.reason || "";
+    return `<div style="display:flex;gap:10px;align-items:center;padding:6px 0;border-bottom:1px dashed #232735;">
+      <span style="flex:0 0 auto;">${_nextStateBadge(next)}</span>
+      <span style="flex:1 1 auto;font-size:12px;color:#c8cddc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(reason)}</span>
+      <span style="flex:0 0 auto;font-size:10px;color:var(--muted);">c${entry.cycle} · ${ts}</span>
+    </div>`;
+  }).join("");
+  return rows;
+}
+
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 function renderJointSeries(series, w, h) {
   const joints = Object.keys(series || {});
   if (!joints.length) return '<div class="empty">(no joint data yet)</div>';
@@ -810,8 +1094,42 @@ async function poll() {
     document.getElementById("m-time-verify").textContent = fmtDur(sd.VERIFY);
     document.getElementById("m-time-explore").textContent = fmtDur(sd.EXPLORE);
     document.getElementById("m-time-retrain").textContent = fmtDur(sd.RETRAIN);
+    document.getElementById("m-time-think").textContent = fmtDur(sd.THINK);
     const totalDur = Object.values(sd).reduce((a, b) => a + (Number(b) || 0), 0);
     document.getElementById("m-time-total").textContent = fmtDur(totalDur);
+
+    // --- Scene-change banner (IDLE = human-in-the-loop) ---
+    // Show the Scene-ready button whenever the learner is actually in
+    // IDLE, even if there's no open claude_scene_change_requested —
+    // the orchestrator is still polling for the flag file and the
+    // operator may need to unblock it.
+    const banner = document.getElementById("scene-banner");
+    const sceneText = document.getElementById("scene-banner-text");
+    const readyBtn = document.getElementById("btn-scene-ready");
+    if (s.current_state === "IDLE") {
+      banner.style.display = "block";
+      if (s.scene_change && s.scene_change.description) {
+        sceneText.textContent = s.scene_change.description;
+      } else {
+        sceneText.textContent = "Learner is in IDLE — press when ready to resume.";
+      }
+      readyBtn.disabled = false;
+    } else {
+      banner.style.display = "none";
+    }
+
+    // --- Training dataset viewer ---
+    datasetViewerState.batches = s.training_datasets || [];
+    renderDatasetViewer();
+
+    // --- Claude THINK panel ---
+    const thinking = s.thinking || { latest: null, history: [], total: 0 };
+    document.getElementById("thinking-latest").innerHTML =
+      renderThinkingLatest(thinking.latest);
+    document.getElementById("thinking-history").innerHTML =
+      renderThinkingHistory(thinking.history);
+    document.getElementById("thinking-count").textContent =
+      `${thinking.total} decision${thinking.total === 1 ? "" : "s"}`;
 
     // --- Explore progress card ---
     const exCard = document.getElementById("m-explore-progress");
@@ -982,17 +1300,35 @@ document.addEventListener("change", (ev) => {
   if (ev.target && ev.target.id === "alltime-range") {
     poll();
   }
+  if (ev.target && ev.target.id === "dataset-batch") {
+    datasetViewerState.selected_index = Number(ev.target.value) || 0;
+    datasetViewerState.page = 0;
+    renderDatasetViewer();
+  }
+});
+
+document.addEventListener("click", (ev) => {
+  const id = ev.target && ev.target.id;
+  if (id === "dataset-prev") {
+    datasetViewerState.page -= 1;
+    renderDatasetViewer();
+  } else if (id === "dataset-next") {
+    datasetViewerState.page += 1;
+    renderDatasetViewer();
+  } else if (id === "dataset-infer") {
+    runDatasetInference();
+  }
 });
 
 document.addEventListener("click", async (ev) => {
-  if (ev.target && ev.target.id === "btn-verify-now") {
+  if (ev.target && ev.target.id === "btn-scene-ready") {
     const btn = ev.target;
     const orig = btn.textContent;
     btn.disabled = true;
-    btn.textContent = "Triggered…";
+    btn.textContent = "Sent…";
     try {
-      const r = await fetch("/trigger/verify", { method: "POST" });
-      btn.textContent = r.ok ? "Queued ✓" : "Failed";
+      const r = await fetch("/scene/ready", { method: "POST" });
+      btn.textContent = r.ok ? "Acknowledged ✓" : "Failed";
     } catch (e) {
       btn.textContent = "Failed";
     }
@@ -1073,6 +1409,99 @@ def _current_state(events: list[dict]) -> str | None:
             return "IDLE"
         if ev == "state":
             return e.get("state")
+    return None
+
+
+def _training_datasets(runs_dir: Path) -> list[dict]:
+    """List every canvas batch directory under `<repo>/datasets/canvas/`
+    that contains at least one `canvas_*.png`. Each batch is exactly
+    what `trainer_driver.retrain_cumulative` merges before training —
+    byte-identical to what `train_diffusion.py` consumed — so the
+    dashboard can browse the model's training data for spot-checking.
+
+    Returns entries newest-first by directory mtime.
+    """
+    # runs_dir is typically <repo>/runs/; datasets/canvas/ is a sibling.
+    canvas_root = runs_dir.parent / "datasets" / "canvas"
+    if not canvas_root.exists():
+        return []
+    batches = sorted(
+        (p for p in canvas_root.iterdir() if p.is_dir()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    out: list[dict] = []
+    for idx, d in enumerate(batches):
+        canvases = sorted(p.name for p in d.glob("canvas_*.png"))
+        if not canvases:
+            continue
+        meta: dict | None = None
+        meta_path = d / "dataset_meta.json"
+        if meta_path.exists():
+            try:
+                raw = json.loads(meta_path.read_text())
+                meta = {
+                    "canvas_count": raw.get("canvas_count"),
+                    "frame_size": raw.get("frame_size"),
+                    "canvas_size": raw.get("canvas_size"),
+                    "separator_width": raw.get("separator_width"),
+                    "motor_strip_height": raw.get("motor_strip_height"),
+                }
+            except (OSError, json.JSONDecodeError):
+                meta = None
+        out.append({
+            "index": idx,
+            "name": d.name,
+            "mtime": d.stat().st_mtime,
+            "canvas_count": len(canvases),
+            "canvases": canvases,
+            "meta": meta,
+        })
+    return out
+
+
+def _thinking(events: list[dict], n: int = 10) -> dict:
+    """Return the latest `claude_think` advice + the last N think events
+    so the dashboard can show Claude's reasoning and decision trail.
+    """
+    thinks = [e for e in events if e.get("event") == "claude_think"]
+    if not thinks:
+        return {"latest": None, "history": [], "total": 0}
+    latest = thinks[-1]
+    history = [
+        {
+            "t": e.get("t"),
+            "cycle": e.get("cycle"),
+            "advice": e.get("advice"),
+        }
+        for e in thinks[-n:]
+    ]
+    return {
+        "latest": {
+            "t": latest.get("t"),
+            "cycle": latest.get("cycle"),
+            "advice": latest.get("advice"),
+        },
+        "history": history,
+        "total": len(thinks),
+    }
+
+
+def _scene_change(events: list[dict]) -> dict | None:
+    """Latest open scene-change request (a `claude_scene_change_requested`
+    without a matching `scene_ready_acknowledged` afterwards). Used by
+    the dashboard banner so the human sees Claude's instructions.
+    """
+    for e in reversed(events):
+        ev = e.get("event")
+        if ev == "scene_ready_acknowledged":
+            return None
+        if ev == "claude_scene_change_requested":
+            return {
+                "description": e.get("description", ""),
+                "requested_at": e.get("t"),
+                "cycle": e.get("cycle"),
+            }
     return None
 
 
@@ -1604,6 +2033,8 @@ def build_state_payload(runs_dir: Path) -> dict:
         "session": session,
         "current_state": _current_state(events),
         "current_phase": _current_phase(events),
+        "scene_change": _scene_change(events),
+        "thinking": _thinking(events),
         "cycle_count": exp["cycle_count"],
         "retrain_count": exp["retrain_count"],
         "total_eps": exp["total_eps"],
@@ -1636,13 +2067,25 @@ def build_state_payload(runs_dir: Path) -> dict:
         "explore_actions": action_counts,
         "joint_state_series": _joint_state_series(events, window=60),
         "stage_durations": stage_durations,
+        "training_datasets": _training_datasets(runs_dir),
     }
 
 
 # ------------------------------------------------------------------ server ---
 
-def make_handler(runs_dir: Path):
+def make_handler(runs_dir: Path, config_path: Path | None = None):
     runs_root_resolved = runs_dir.resolve()
+    # datasets/canvas/ is a sibling of runs_dir in the default repo
+    # layout. This is where `trainer_driver.build_canvases` writes the
+    # training canvases that retrain_cumulative merges.
+    canvas_root = (runs_dir.parent / "datasets" / "canvas").resolve()
+    # On-demand inference outputs live under runs_dir so the same
+    # resolve/under-runs path-traversal guard works.
+    on_demand_root = (runs_dir / "on_demand_inference").resolve()
+    # Map UI-returned tokens back to file paths so the browser can
+    # fetch just the PNG without leaking filesystem paths.
+    infer_tokens: dict[str, Path] = {}
+    infer_tokens_lock = threading.Lock()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # silence default access log
@@ -1692,21 +2135,176 @@ def make_handler(runs_dir: Path):
                     return
                 self._send(200, resolved.read_bytes(), "image/png")
                 return
+            if path.startswith("/training_canvas/"):
+                # /training_canvas/<batch_dir>/<canvas_filename>
+                tail = unquote(path[len("/training_canvas/"):])
+                parts = tail.split("/", 1)
+                if len(parts) != 2:
+                    self.send_error(400)
+                    return
+                batch_name, canvas_name = parts
+                img_path = canvas_root / batch_name / canvas_name
+                try:
+                    resolved = img_path.resolve()
+                    resolved.relative_to(canvas_root)
+                except (ValueError, OSError):
+                    self.send_error(403)
+                    return
+                if not resolved.exists() or not resolved.is_file():
+                    self.send_error(404)
+                    return
+                self._send(200, resolved.read_bytes(), "image/png")
+                return
+            if path.startswith("/on_demand_inference/"):
+                # /on_demand_inference/<token> — opaque key assigned by
+                # /api/infer_canvas. Token maps to an absolute .png path
+                # under runs_dir/on_demand_inference.
+                token = unquote(path[len("/on_demand_inference/"):])
+                with infer_tokens_lock:
+                    target = infer_tokens.get(token)
+                if target is None:
+                    self.send_error(404)
+                    return
+                try:
+                    resolved = target.resolve()
+                    resolved.relative_to(on_demand_root)
+                except (ValueError, OSError):
+                    self.send_error(403)
+                    return
+                if not resolved.exists() or not resolved.is_file():
+                    self.send_error(404)
+                    return
+                self._send(200, resolved.read_bytes(), "image/png")
+                return
             self.send_error(404)
 
         def do_POST(self):
             path = self.path.split("?", 1)[0]
-            if path == "/trigger/verify":
-                # Drop a sentinel file; the orchestrator polls for it
-                # during IDLE sleeps and short-circuits straight to VERIFY.
+            if path == "/scene/ready":
+                # Human operator has finished rearranging the physical
+                # scene Claude requested. Drop the sentinel file the
+                # orchestrator's IDLE branch is polling for.
                 try:
                     runs_dir.mkdir(parents=True, exist_ok=True)
-                    (runs_dir / "trigger_verify.flag").write_text("1")
+                    (runs_dir / "scene_ready.flag").write_text("1")
                     self._send(200, b'{"ok":true}', "application/json")
                 except Exception as e:
                     self._send(500, str(e).encode("utf-8"), "text/plain")
                 return
+            if path == "/api/infer_canvas":
+                self._handle_infer_canvas()
+                return
             self.send_error(404)
+
+        def _handle_infer_canvas(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                raw = self.rfile.read(length) if length > 0 else b""
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                self._send(400, json.dumps({"error": f"bad json: {e}"}).encode(),
+                           "application/json")
+                return
+
+            batch_name = body.get("batch_name")
+            canvas_names = body.get("canvas_names") or []
+            if not batch_name or not isinstance(canvas_names, list) or not canvas_names:
+                self._send(400,
+                           json.dumps({"error": "batch_name + canvas_names required"}).encode(),
+                           "application/json")
+                return
+            if len(canvas_names) > 6:
+                self._send(400,
+                           json.dumps({"error": "max 6 canvases per request"}).encode(),
+                           "application/json")
+                return
+            if config_path is None:
+                self._send(400,
+                           json.dumps({"error": "dashboard started without --config; cannot run inference"}).encode(),
+                           "application/json")
+                return
+
+            batch_dir = canvas_root / batch_name
+            try:
+                resolved = batch_dir.resolve()
+                resolved.relative_to(canvas_root)
+            except (ValueError, OSError):
+                self._send(403,
+                           json.dumps({"error": "batch path outside canvas root"}).encode(),
+                           "application/json")
+                return
+            if not resolved.is_dir():
+                self._send(404,
+                           json.dumps({"error": f"batch dir not found: {batch_name}"}).encode(),
+                           "application/json")
+                return
+
+            # Per-request output dir so concurrent clicks don't stomp on
+            # each other. Keep the directory's resolved path under
+            # on_demand_root so the /on_demand_inference GET guard holds.
+            req_id = time.strftime("%Y%m%d_%H%M%S") + "_" + secrets.token_hex(3)
+            out_dir = on_demand_root / batch_name / req_id
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            cmd = [
+                _sys.executable,
+                str(Path(__file__).resolve().parent / "infer_on_canvas.py"),
+                "--config", str(config_path),
+                "--batch-dir", str(resolved),
+                "--out-dir", str(out_dir),
+            ]
+            for n in canvas_names:
+                cmd.extend(["--canvas-name", str(n)])
+
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=180,  # loading the predictor + 6 inferences shouldn't take >3 min
+                )
+            except subprocess.TimeoutExpired:
+                self._send(504,
+                           json.dumps({"error": "inference subprocess timed out"}).encode(),
+                           "application/json")
+                return
+
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or "").strip().splitlines()
+                tail = "\n".join(err[-10:])
+                self._send(500,
+                           json.dumps({
+                               "error": f"inference failed (exit {proc.returncode})",
+                               "stderr_tail": tail,
+                           }).encode(),
+                           "application/json")
+                return
+
+            results: list[dict] = []
+            for line in (proc.stdout or "").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "fatal" in obj:
+                    self._send(500,
+                               json.dumps({"error": obj["fatal"]}).encode(),
+                               "application/json")
+                    return
+                if "output" in obj:
+                    tok = secrets.token_urlsafe(12)
+                    with infer_tokens_lock:
+                        infer_tokens[tok] = Path(obj["output"])
+                    obj["token"] = tok
+                    obj.pop("output", None)  # don't leak the fs path to the client
+                results.append(obj)
+
+            self._send(200,
+                       json.dumps({"results": results}).encode(),
+                       "application/json")
 
     return Handler
 
@@ -1716,12 +2314,21 @@ class _ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
-def serve(runs_dir: Path, port: int, host: str = "127.0.0.1") -> None:
+def serve(
+    runs_dir: Path,
+    port: int,
+    host: str = "127.0.0.1",
+    config_path: Path | None = None,
+) -> None:
     runs_dir.mkdir(parents=True, exist_ok=True)
-    handler = make_handler(runs_dir)
+    handler = make_handler(runs_dir, config_path=config_path)
     with _ThreadedServer((host, port), handler) as httpd:
         url = f"http://{host}:{port}/"
         print(f"dashboard: {url}  (runs_dir={runs_dir})")
+        if config_path is not None:
+            print(f"  inference enabled via --config {config_path}")
+        else:
+            print("  inference button disabled — launch with --config <yaml> to enable")
         print("Ctrl-C to stop.")
         try:
             httpd.serve_forever()
@@ -1734,8 +2341,15 @@ def main():
     p.add_argument("--runs-dir", default=str(DEFAULT_RUNS))
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--host", default="127.0.0.1")
+    p.add_argument(
+        "--config",
+        default=None,
+        help="Path to YAML config used for on-demand inference "
+             "(required for the dataset viewer's Run inference button).",
+    )
     args = p.parse_args()
-    serve(Path(args.runs_dir), args.port, args.host)
+    cfg_path = Path(args.config).resolve() if args.config else None
+    serve(Path(args.runs_dir), args.port, args.host, config_path=cfg_path)
 
 
 if __name__ == "__main__":

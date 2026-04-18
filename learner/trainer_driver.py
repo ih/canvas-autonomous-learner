@@ -9,13 +9,66 @@ scratch) -> evaluate.
 from __future__ import annotations
 
 import json
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional
+
+from .gpu_monitor import GpuMonitor
+
+
+# --------------------------------------------------- subprocess exceptions
+
+
+class SubprocessMemoryAbort(Exception):
+    """Raised when the GPU monitor reports sustained VRAM pressure during
+    a training subprocess. The subprocess is killed before the
+    exception is raised.
+    """
+
+    def __init__(self, tag: str, summary: dict, last_lines: Optional[list[str]] = None):
+        self.tag = tag
+        self.summary = summary or {}
+        self.last_lines = last_lines or []
+        super().__init__(f"[{tag}] memory abort: {self.summary}")
+
+
+class SubprocessStalled(Exception):
+    """Raised when a training subprocess emits no `training_progress`
+    events for longer than `stall_timeout_s`. The most common cause on
+    this host is VRAM saturation dropping throughput to near-zero.
+    """
+
+    def __init__(
+        self,
+        tag: str,
+        seconds_since_last_progress: float,
+        summary: Optional[dict] = None,
+        last_lines: Optional[list[str]] = None,
+    ):
+        self.tag = tag
+        self.seconds_since_last_progress = float(seconds_since_last_progress)
+        self.summary = summary or {}
+        self.last_lines = last_lines or []
+        super().__init__(
+            f"[{tag}] stalled: {self.seconds_since_last_progress:.1f}s "
+            f"since last progress"
+        )
+
+
+class SubprocessTimeout(Exception):
+    """Raised when a subprocess exceeds its hard wall-clock timeout."""
+
+    def __init__(self, tag: str, timeout_s: float):
+        self.tag = tag
+        self.timeout_s = float(timeout_s)
+        super().__init__(f"[{tag}] hard timeout after {self.timeout_s:.0f}s")
 
 
 def _stamp() -> str:
@@ -65,7 +118,33 @@ def _emit_training_line_events(tag: str, line: str, event_log) -> None:
         )
 
 
-def _run(cmd: list[str], cwd: str | Path | None = None, event_log=None, tag: str = "") -> None:
+def _kill_subprocess(proc: subprocess.Popen) -> None:
+    """Terminate then kill a subprocess, best-effort."""
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+    except Exception:
+        pass
+
+
+def _run(
+    cmd: list[str],
+    cwd: str | Path | None = None,
+    event_log=None,
+    tag: str = "",
+    *,
+    monitor: Optional[GpuMonitor] = None,
+    abort_frac: float = 0.93,
+    stall_timeout_s: Optional[float] = None,
+    hard_timeout_s: Optional[float] = None,
+) -> None:
     """Spawn a subprocess, stream stdout line-by-line, and (for tagged
     training invocations) parse per-epoch progress into `training_progress`
     events so the live dashboard can show a training loss chart while the
@@ -74,6 +153,13 @@ def _run(cmd: list[str], cwd: str | Path | None = None, event_log=None, tag: str
     Non-training subprocesses (create_dataset, combine_datasets, evaluate)
     still stream stdout to this process's stdout so the operator can tail
     them from the terminal, but nothing is parsed from their output.
+
+    When `monitor` is passed, poll it for sustained VRAM pressure and
+    raise `SubprocessMemoryAbort` if the threshold is breached. When
+    `stall_timeout_s` is set (training only), raise `SubprocessStalled`
+    if no `training_progress` line arrives within that window. When
+    `hard_timeout_s` is set, raise `SubprocessTimeout` after that total
+    wall-clock duration.
     """
     if event_log is not None:
         event_log.log("subprocess_start", tag=tag, cmd=cmd, cwd=str(cwd) if cwd else None)
@@ -92,18 +178,101 @@ def _run(cmd: list[str], cwd: str | Path | None = None, event_log=None, tag: str
             event_log.log("subprocess_failed", tag=tag, error=str(e))
         raise
 
+    # Reader thread pushes each stdout line onto a queue; a `None` sentinel
+    # marks end-of-stream so the main loop knows when to stop polling.
+    line_q: queue.Queue = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            assert proc.stdout is not None
+            for raw in proc.stdout:
+                line_q.put(raw.rstrip("\r\n"))
+        finally:
+            line_q.put(None)
+
+    reader = threading.Thread(target=_reader, name=f"_run-{tag}", daemon=True)
+    reader.start()
+
+    rolling_lines: deque[str] = deque(maxlen=30)
+    start_t = time.time()
+    last_progress_t = start_t
+    poll_tick_s = 2.0
+
     try:
-        assert proc.stdout is not None
-        for raw_line in proc.stdout:
-            line = raw_line.rstrip("\r\n")
-            if not line:
-                continue
-            # Always echo to our own stdout so the operator sees live logs.
-            sys.stdout.write(line + "\n")
-            sys.stdout.flush()
-            _emit_training_line_events(tag, line, event_log)
+        while True:
+            end_of_stream = False
+            try:
+                line = line_q.get(timeout=poll_tick_s)
+            except queue.Empty:
+                line = "__TICK__"
+
+            if line is None:
+                end_of_stream = True
+            elif line == "__TICK__":
+                pass
+            else:
+                rolling_lines.append(line)
+                if line:
+                    sys.stdout.write(line + "\n")
+                    sys.stdout.flush()
+                    if tag == "train_diffusion" and _EPOCH_RE.search(line):
+                        last_progress_t = time.time()
+                    _emit_training_line_events(tag, line, event_log)
+
+            # Abort conditions — checked every tick regardless of whether a
+            # line arrived, so we can intercept a subprocess that has gone
+            # silent from VRAM pressure.
+            if monitor is not None and monitor.is_under_pressure(abort_frac):
+                summary = monitor.summary()
+                last_n = list(rolling_lines)
+                if event_log is not None:
+                    event_log.log(
+                        "training_memory_abort",
+                        tag=tag,
+                        summary=summary,
+                        last_lines=last_n,
+                    )
+                _kill_subprocess(proc)
+                raise SubprocessMemoryAbort(tag, summary, last_n)
+
+            if stall_timeout_s and tag == "train_diffusion":
+                gap = time.time() - last_progress_t
+                if gap > float(stall_timeout_s):
+                    summary = monitor.summary() if monitor is not None else {}
+                    last_n = list(rolling_lines)
+                    if event_log is not None:
+                        event_log.log(
+                            "training_stalled",
+                            tag=tag,
+                            seconds_since_last_progress=gap,
+                            stall_timeout_s=float(stall_timeout_s),
+                            summary=summary,
+                            last_lines=last_n,
+                        )
+                    _kill_subprocess(proc)
+                    raise SubprocessStalled(tag, gap, summary, last_n)
+
+            if hard_timeout_s:
+                total = time.time() - start_t
+                if total > float(hard_timeout_s):
+                    if event_log is not None:
+                        event_log.log(
+                            "subprocess_timeout",
+                            tag=tag,
+                            timeout_s=float(hard_timeout_s),
+                        )
+                    _kill_subprocess(proc)
+                    raise SubprocessTimeout(tag, float(hard_timeout_s))
+
+            if end_of_stream:
+                break
     finally:
-        proc.wait()
+        # Make sure the reader thread is not left blocked on proc.stdout.
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _kill_subprocess(proc)
+        reader.join(timeout=5)
 
     if proc.returncode != 0:
         if event_log is not None:
@@ -259,7 +428,37 @@ def train(
                 epochs=int(epochs),
                 early_stop_patience=early_stop,
             )
-    _run(cmd, cwd=cwm, event_log=event_log, tag="train_diffusion")
+
+    # GPU monitor: poll nvidia-smi, abort on sustained VRAM pressure or
+    # on training_progress stall. Thresholds are read from cfg.gpu with
+    # conservative defaults tuned for a 32 GB RTX 5090.
+    gpu_cfg = getattr(cfg, "gpu", None)
+    abort_frac = float(getattr(gpu_cfg, "memory_abort_frac", 0.93)) if gpu_cfg else 0.93
+    warn_frac = float(getattr(gpu_cfg, "memory_warn_frac", 0.85)) if gpu_cfg else 0.85
+    sample_interval_s = float(getattr(gpu_cfg, "sample_interval_s", 5.0)) if gpu_cfg else 5.0
+    stall_timeout_s = float(getattr(cfg.cadence, "training_stall_timeout_s", 600.0))
+    hard_timeout_s = float(getattr(cfg.cadence, "retrain_timeout_s", 7200.0))
+
+    monitor = GpuMonitor(
+        sample_interval_s=sample_interval_s,
+        warn_frac=warn_frac,
+        abort_frac=abort_frac,
+        event_log=event_log,
+    )
+    monitor.start()
+    try:
+        _run(
+            cmd,
+            cwd=cwm,
+            event_log=event_log,
+            tag="train_diffusion",
+            monitor=monitor,
+            abort_frac=abort_frac,
+            stall_timeout_s=stall_timeout_s,
+            hard_timeout_s=hard_timeout_s,
+        )
+    finally:
+        monitor.stop()
 
     # train_diffusion.py writes `best.pth` (only when val improves) and
     # `final.pth` (always, at the end). Prefer best.pth; fall back to
@@ -378,6 +577,27 @@ def retrain_cumulative(
                 cfg, new_ckpt, locked_val_dataset, eval_out_locked,
                 event_log=event_log,
             )
+    except SubprocessMemoryAbort as e:
+        return {
+            "memory_abort": True,
+            "tag": e.tag,
+            "summary": e.summary,
+            "last_lines": e.last_lines,
+        }
+    except SubprocessStalled as e:
+        return {
+            "stalled": True,
+            "tag": e.tag,
+            "seconds_since_last_progress": e.seconds_since_last_progress,
+            "summary": e.summary,
+            "last_lines": e.last_lines,
+        }
+    except SubprocessTimeout as e:
+        return {
+            "timeout": True,
+            "tag": e.tag,
+            "timeout_s": e.timeout_s,
+        }
     except Exception as e:
         if event_log is not None:
             event_log.log("retrain_exception", error=str(e))

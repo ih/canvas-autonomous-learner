@@ -51,7 +51,16 @@ thresholds:
   max_consecutive_rejections: 3     # force-swap after 3 rejections in a row
 
 cadence:
-  idle_seconds: 60
+  # IDLE used to be a fixed-duration sleep. With Claude-in-the-loop,
+  # THINK replaces it — idle_seconds is unused by the orchestrator but
+  # kept so older configs still parse. The new IDLE state is a human-
+  # in-the-loop wait for a physical scene change and has no timeout.
+  idle_seconds: 0
+  claude_advisor_enabled: true
+  claude_max_consecutive_retrains: 5
+  claude_advisor_crash_timeout_s: 1800
+  claude_advisor_model: opus         # "opus" / "sonnet" / "haiku" / full slug / null
+  claude_advisor_effort: max         # low / medium / high / max — gates extended thinking
   probes_per_verify: 6              # used by the decision-path mean_in_range gate
   window_size: 24
   settle_time: 0.5
@@ -70,6 +79,22 @@ cadence:
   warmup_cycles: 2                  # first 2 cycles always EXPLORE
   explore_max_retries: 2
   explore_retry_backoff: 10.0
+  # Abort training if no training_progress line arrives for this many
+  # seconds. On this box VRAM saturation collapses throughput without
+  # raising a CUDA OOM, so we need a proactive stall signal. 10 min.
+  training_stall_timeout_s: 600
+  # Hard ceiling per training invocation (2 h) — cold-start at 300 epochs
+  # normally finishes well within this, fine-tune far faster.
+  retrain_timeout_s: 7200
+
+# GPU VRAM monitoring — nvidia-smi polled every sample_interval_s during
+# training. Abort if sustained >abort_frac of VRAM for ~30 s. 32 GB card
+# saturated on the previous run; these defaults give Claude headroom to
+# push the config upward without hitting the ceiling.
+gpu:
+  memory_abort_frac: 0.93
+  memory_warn_frac: 0.85
+  sample_interval_s: 5.0
 
 # Sequential curriculum (Option B): shoulder_pan first, then elbow_flex.
 range:

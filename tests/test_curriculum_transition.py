@@ -87,6 +87,13 @@ def _make_cfg(tmp_path: Path, *,
             cold_start_epochs=100, ft_epochs=5,
             safety_cap_episodes=5000, warmup_cycles=0,
             explore_max_retries=0, explore_retry_backoff=0.0,
+            # Tests assert the legacy tau-gated routing, so disable
+            # the Claude advisor so THINK immediately falls through
+            # to `pending_default_next_state`.
+            claude_advisor_enabled=False,
+            claude_max_consecutive_retrains=5,
+            claude_advisor_crash_timeout_s=1800.0,
+            claude_advisor_model=None,
         ),
         actions=SimpleNamespace(candidates=[1, 2, 3]),
         explore=SimpleNamespace(

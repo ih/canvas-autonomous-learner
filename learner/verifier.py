@@ -25,6 +25,7 @@ import numpy as np
 
 from . import explorer
 from .episode_canvas import process_recorded_episode
+from .gpu_monitor import sample_gpu
 from .metrics import ProbeResult, RollingWindow
 from .range_tracker import CurriculumState
 
@@ -146,6 +147,21 @@ def verify_batch(
             event_log.log("verify_no_predictor", cycle=cycle)
         return []
 
+    # Snapshot VRAM once before the probe loop so the advisor can see
+    # how much headroom inference had at this cycle. Cheap: ~20 ms
+    # nvidia-smi call, logged at most once per VERIFY.
+    if event_log is not None:
+        headroom = sample_gpu()
+        if headroom is not None:
+            event_log.log(
+                "verify_gpu_headroom",
+                cycle=cycle,
+                used_mb=int(headroom["used_mb"]),
+                total_mb=int(headroom["total_mb"]),
+                used_frac=float(headroom["used_frac"]),
+                util_pct=int(headroom["util_pct"]),
+            )
+
     probes: list[ProbeResult] = []
     for probe_idx in range(num_probes):
         try:
@@ -159,9 +175,15 @@ def verify_batch(
                 filename_prefix="p",
             )
         except Exception as e:
+            msg = str(e).lower()
+            is_oom = (
+                "out of memory" in msg
+                or "outofmemoryerror" in msg
+                or "cuda error: out of memory" in msg
+            )
             if event_log is not None:
                 event_log.log(
-                    "verify_probe_failed",
+                    "inference_oom" if is_oom else "verify_probe_failed",
                     cycle=cycle, probe_idx=probe_idx, error=str(e),
                 )
             continue
