@@ -1,0 +1,177 @@
+# Two-joint experiment — Arm `simultaneous`:
+# cold-start autonomous learner that explores shoulder_pan AND elbow_flex
+# from cycle 0, with no range curriculum (both joints at full range
+# throughout). Paired with `sequential.yaml` which runs a narrow-to-wide
+# primary→secondary curriculum; the two arms differ ONLY in exploration
+# policy and curriculum staging.
+#
+# Requires (per PLAN / swift-spinning-wind):
+# - new acting-joint canvas encoding (16px action color + 16px per-joint
+#   action mask). Deploys in Phase 2 of the implementation; until then
+#   the model has no explicit signal for which joint is acting.
+# - locked val corpus at `paths.locked_val_shoulder` / `locked_val_elbow`.
+
+paths:
+  canvas_world_model: ../canvas-world-model
+  canvas_robot_control: ../canvas-robot-control
+  robotic_foundation_model_tests: ../robotic-foundation-model-tests
+  base_canvas: null
+  val_dataset: null
+  # Locked val corpus split per acting joint — see plan "Locked val corpus"
+  # and code change #11. Recorded once before either arm starts.
+  locked_val_shoulder: ./datasets/locked_val/shoulder
+  locked_val_elbow: ./datasets/locked_val/elbow
+  # Fallback single locked val (used by legacy code paths that don't yet
+  # split per joint — per-joint eval lands in change #8 next turn).
+  locked_val_dataset: ./datasets/locked_val/shoulder
+  live_checkpoint: null               # cold-start — no preload
+  ckpt_dir: ./runs/sim/checkpoints
+  canvas_out: ./runs/sim/canvas
+  lerobot_out: ./runs/sim/lerobot
+  runs_dir: ./runs/sim
+  registry_file: ./runs/sim/registry.json
+  python: C:/Projects/pythonenv-lerobot/Scripts/python.exe
+
+robot:
+  port: COM3
+  robot_id: my_so101_follower
+  # `control_joint` is used as a fallback / legacy default. With the pooled
+  # explore config below, the single_action policy randomizes its target
+  # each episode among `explore.joints`; this value is effectively ignored
+  # during exploration but kept for range_tracker legacy compatibility.
+  control_joint: shoulder_pan
+  step_size: 10.0
+  joint_min: -60.0
+  joint_max: 60.0
+  base_camera: 1
+  wrist_camera: 0
+  camera_width: 640
+  camera_height: 480
+  camera_fps: 10
+  home:
+    shoulder_pan: 21.07
+    shoulder_lift: -100.00
+    elbow_flex: 94.92
+    wrist_flex: 31.82
+    wrist_roll: 5.12
+    gripper: 10.13
+
+thresholds:
+  tau_low: 0.05
+  tau_high: 0.10
+  val_guard: 1.25
+  max_consecutive_rejections: 3
+
+cadence:
+  idle_seconds: 0
+  claude_advisor_enabled: true
+  claude_max_consecutive_retrains: 5
+  claude_advisor_crash_timeout_s: 1800
+  claude_advisor_model: opus
+  claude_advisor_effort: max
+  probes_per_verify: 6
+  window_size: 24
+  settle_time: 0.5
+  base_explore_batch_size: 20
+  explore_batch_size_min: 20
+  explore_batch_size_max: 20
+  max_sub_bursts: 1
+  min_sub_burst_size: 20
+  cold_start_epochs: 300
+  ft_epochs: 150
+  early_stop_patience: 30
+  # Safety cap raised vs armB because two-joint learning may need more
+  # episodes than single-joint to reach plateau.
+  safety_cap_episodes: 3000
+  warmup_cycles: 2
+  explore_max_retries: 2
+  explore_retry_backoff: 10.0
+  training_stall_timeout_s: 600
+  retrain_timeout_s: 7200
+
+gpu:
+  memory_abort_frac: 0.93
+  memory_warn_frac: 0.85
+  sample_interval_s: 5.0
+
+# No curriculum staging. Both joints run at full range from cycle 0 —
+# this is the "no curriculum" baseline that Arm `sequential` is compared
+# against. `enabled: false` disables CurriculumState entirely.
+range:
+  enabled: false
+
+training:
+  patch_size: 16
+  embed_dim: 512
+  depth: 12
+  num_heads: 16
+  num_train_timesteps: 1000
+  beta_schedule: cosine
+  prediction_type: sample
+  lr: 3.0e-4
+  weight_decay: 0.01
+  lr_schedule: cosine
+  warmup_epochs: 15
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+  batch_size: 4
+  seed: 42
+  val_ratio: 0.1
+  # Lock motor-strip normalization at SO-101 hardware limits so the
+  # motor-strip rendering is stable across incremental canvas builds and
+  # future joint-3 data won't shift the bounds. Plumbed through both
+  # create_dataset.py and combine_datasets.py via --motor-bounds-json.
+  # Order: [shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper]
+  motor_bounds:
+    motor_norm_min: [-100.0, -100.0, -100.0, -100.0, -100.0, -100.0]
+    motor_norm_max: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
+
+actions:
+  candidates: [1, 2, 3]
+  probe_weights: null
+
+explore:
+  # Pooled two-joint exploration. The single_action policy picks a target
+  # joint uniformly from `joints` each episode and ONLY that joint moves
+  # during the recorded action (one acting joint per episode).
+  vary_target_joint: true
+  joints:
+    - shoulder_pan.pos
+    - elbow_flex.pos
+  # Explicit joint ranges for EVERY pool joint. REQUIRED when
+  # vary_target_joint=true: draccus replaces the policy's joint_ranges
+  # dict with whatever we pass, and any joint missing from the dict
+  # falls through to the recorder's unsafe (-60, 60) default (per
+  # configuration_single_action.py::get_joint_range). For elbow_flex
+  # that default would drive the arm far below its safe minimum.
+  # Matches the locked-val corpus so training and eval cover the same
+  # joint space.
+  joint_ranges:
+    shoulder_pan.pos: [-60.0, 60.0]
+    elbow_flex.pos: [50.0, 90.0]
+  # Still required by the recorder CLI when vary_target_joint=true —
+  # modeling_single_action.py ignores `joint_name` in random mode but
+  # the CLI arg must be present and valid.
+  policy_joint_name: shoulder_pan.pos
+  action_duration: 1.0
+  start_buffer: 2.5
+  dataset_fps: 10
+  base_camera_name: base_0_rgb
+  wrist_camera_name: left_wrist_0_rgb
+  # Namespaces the LeRobot HF cache so this arm's recorded episodes
+  # don't co-mingle with the sequential arm's cache.
+  repo_id_prefix: sim/autonomous-explore
+
+  # Park non-acting joints at home before each EXPLORE so the scene is
+  # consistent across episodes. shoulder_pan and elbow_flex are EXCLUDED
+  # because they're the pooled acting joints.
+  inactive_joint_positions:
+    shoulder_lift: -100.00
+    wrist_flex: 31.82
+    wrist_roll: 5.12
+    gripper: 10.13
+
+verify:
+  repo_id_prefix: sim/autonomous-verify
+
+dry_run: false

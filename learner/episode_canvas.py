@@ -235,10 +235,24 @@ def process_recorded_episode(
     Image.fromarray(out_img).save(out_path)
 
     motor_state_arr = np.asarray(motor_state, dtype=np.float32)
+    motor_next_arr = np.asarray(motor_next, dtype=np.float32)
+    # Infer the acting joint from the motor delta between the action's
+    # before and after states. Single_action always moves exactly one
+    # joint by ±step_size (≥10 units) while non-acting joints fluctuate
+    # by <1 unit of servo noise — so the argmax over the absolute delta
+    # reliably picks the acting joint for non-hold actions. For holds
+    # (all-zero delta) leave it None.
+    acting_joint_idx: Optional[int] = None
+    if motor_state_arr.shape == motor_next_arr.shape and motor_state_arr.size > 0:
+        delta = np.abs(motor_next_arr - motor_state_arr)
+        if float(delta.max()) > 1.0:
+            acting_joint_idx = int(np.argmax(delta))
+
     return ProbeResult(
         state_key=_quantize_motor(motor_state_arr),
         action=action,
         mse=mse,
         timestamp=time.time(),
         motor_state=tuple(float(x) for x in motor_state_arr),
+        acting_joint_idx=acting_joint_idx,
     )

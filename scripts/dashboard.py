@@ -2336,6 +2336,36 @@ def serve(
             print("\nshutting down…")
 
 
+def _spawn_canvas_inference_worker(
+    config_path: Path,
+    runs_dir: Path,
+) -> Optional[subprocess.Popen]:
+    """Launch scripts/explore_inference.py as a child subprocess.
+
+    explore_inference watches EXPLORE episodes and writes action-canvas
+    PNGs into `examples_<session>/` that this dashboard picks up via
+    its file watcher. Spawning it from the dashboard means "starting
+    the metrics dashboard also starts the process for displaying the
+    canvases live" — the user-visible UX matches.
+    """
+    script = Path(__file__).resolve().parent / "explore_inference.py"
+    if not script.exists():
+        print(f"[dashboard] skip canvas-inference worker: {script} not found")
+        return None
+    py = _sys.executable
+    try:
+        proc = subprocess.Popen(
+            [py, str(script), "--config", str(config_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+        print(f"[dashboard] canvas-inference worker pid={proc.pid} (config={config_path})")
+        return proc
+    except Exception as e:
+        print(f"[dashboard] failed to spawn canvas-inference worker: {e}")
+        return None
+
+
 def main():
     p = argparse.ArgumentParser(description="Live canvas-autonomous-learner dashboard")
     p.add_argument("--runs-dir", default=str(DEFAULT_RUNS))
@@ -2347,9 +2377,28 @@ def main():
         help="Path to YAML config used for on-demand inference "
              "(required for the dataset viewer's Run inference button).",
     )
+    p.add_argument(
+        "--no-canvas-inference",
+        action="store_true",
+        help="Suppress the auto-spawned explore_inference worker.",
+    )
     args = p.parse_args()
     cfg_path = Path(args.config).resolve() if args.config else None
-    serve(Path(args.runs_dir), args.port, args.host, config_path=cfg_path)
+
+    canvas_worker: Optional[subprocess.Popen] = None
+    if cfg_path is not None and not args.no_canvas_inference:
+        canvas_worker = _spawn_canvas_inference_worker(cfg_path, Path(args.runs_dir))
+
+    try:
+        serve(Path(args.runs_dir), args.port, args.host, config_path=cfg_path)
+    finally:
+        if canvas_worker is not None and canvas_worker.poll() is None:
+            print(f"[dashboard] terminating canvas-inference worker pid={canvas_worker.pid}")
+            canvas_worker.terminate()
+            try:
+                canvas_worker.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                canvas_worker.kill()
 
 
 if __name__ == "__main__":

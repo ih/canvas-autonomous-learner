@@ -25,6 +25,11 @@ class ProbeResult:
     # error-driven selectors need it; the legacy `mean()` / `per_action_mean`
     # accessors don't. `None` means "no state information available".
     motor_state: Optional[tuple[float, ...]] = None
+    # Index of the joint that was acting during this probe (0=shoulder_pan,
+    # 2=elbow_flex, etc). Derived from the motor-state delta in
+    # process_recorded_episode. None when the acting joint couldn't be
+    # inferred (e.g. hold actions where no joint moved).
+    acting_joint_idx: Optional[int] = None
 
 
 class RollingWindow:

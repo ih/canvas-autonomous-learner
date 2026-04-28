@@ -44,6 +44,7 @@ from urllib.parse import unquote
 
 import cv2
 import numpy as np
+from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -60,7 +61,6 @@ from learner.registry import Registry  # noqa: E402
 class DashboardState:
     """In-memory state shared across requests, guarded by `bus_lock`."""
 
-    before_cameras: Optional[dict] = None
     before_motor: Optional[np.ndarray] = None
     before_ctx: Optional[np.ndarray] = None
     before_ts: Optional[float] = None
@@ -70,7 +70,6 @@ class DashboardState:
     active_checkpoint: Optional[str] = None  # path of currently loaded model
 
     def clear_before(self) -> None:
-        self.before_cameras = None
         self.before_motor = None
         self.before_ctx = None
         self.before_ts = None
@@ -104,15 +103,10 @@ def _wait_until_motion_settled(
     min_wait: float = 0.25,
     timeout: float = 3.5,
 ) -> None:
-    """Block until motor position stops changing.
+    """Block until the max-joint delta stays below `stable_threshold` degrees
+    for `stable_window` seconds, bounded by [min_wait, timeout].
 
-    Poll positions every `poll_interval` seconds. Consider the arm settled
-    once the max-across-joints absolute delta stays under `stable_threshold`
-    degrees for `stable_window` seconds. `min_wait` guarantees we don't
-    return before the motors have had a chance to start moving. `timeout`
-    caps the total wait so a stuck joint doesn't hang the request.
-
-    Assumes the caller holds the bus lock.
+    Caller must hold the bus lock.
     """
     t_start = time.time()
     prev = _read_motor_positions(hw)
@@ -134,16 +128,6 @@ def _wait_until_motion_settled(
                 return
         else:
             stable_since = None
-
-
-def _stack_base_wrist(base: np.ndarray, wrist: np.ndarray,
-                      frame_size=(224, 224)) -> np.ndarray:
-    """Vertically stack base (top) and wrist (bottom) into a single
-    training-format context frame shaped (2*H, W, 3)."""
-    h, w = frame_size
-    base_r = cv2.resize(base, (w, h), interpolation=cv2.INTER_LANCZOS4)
-    wrist_r = cv2.resize(wrist, (w, h), interpolation=cv2.INTER_LANCZOS4)
-    return np.vstack([base_r, wrist_r])
 
 
 def _predict_motor_after(motor_before: np.ndarray, joint_idx: int,
@@ -208,312 +192,10 @@ def _build_two_frame_canvas(
     return np.concatenate([label_img, canvas], axis=0)
 
 
-def _save_canvas(canvas: np.ndarray, out_dir: Path, prefix: str) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S") + f"_{secrets.token_hex(3)}"
-    path = out_dir / f"{prefix}_{ts}.png"
-    from PIL import Image
-    Image.fromarray(canvas).save(path)
-    return path
-
-
 # --------------------------------------------------------------- HTML UI ---
 
 
-INDEX_HTML = r"""<!doctype html>
-<html><head><meta charset="utf-8"><title>live inference</title>
-<style>
-  :root { --bg:#0f1115; --panel:#171a21; --ink:#e6e8ef; --muted:#8a93a6; --accent:#5aa9ff; --warn:#ff9c5a; --ok:#65d88c; --bad:#ff6464; }
-  html, body { background: var(--bg); color: var(--ink); font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; }
-  header { padding: 12px 20px; border-bottom: 1px solid #2a2f3b; display: flex; align-items: center; gap: 14px; }
-  header h1 { font-size: 15px; font-weight: 600; margin: 0; }
-  .pill { font-size: 11px; padding: 3px 9px; border-radius: 12px; background:#2a2f3b; color: var(--muted); }
-  .pill.ok { background:#12361e; color: var(--ok); }
-  .pill.bad { background:#3a1212; color: var(--bad); }
-  main { display: grid; grid-template-columns: minmax(320px, 480px) 1fr; gap: 14px; padding: 14px 20px; align-items: start; }
-  .panel { background: var(--panel); border: 1px solid #232735; border-radius: 8px; padding: 12px 14px; }
-  .panel h2 { font-size: 11px; margin: 0 0 8px 0; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); }
-  img.canvas { display: block; max-width: 100%; width: auto; height: auto; max-height: calc((100vh - 140px) / 2); margin: 0 auto; border: 1px solid #2a2f3b; border-radius: 4px; background: #000; object-fit: contain; }
-  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
-  select, button { background: #1d2230; color: var(--ink); border: 1px solid #2b3246; padding: 6px 10px; border-radius: 4px; font-size: 13px; font-family: inherit; }
-  button { cursor: pointer; }
-  button.primary { background: #2e9a4f; color: #fff; border: 0; padding: 8px 16px; font-weight: 600; }
-  button.primary:hover { background: #37b35a; }
-  button.warn { background: #b35a2e; color: #fff; border: 0; padding: 8px 16px; font-weight: 600; }
-  button.warn:hover { background: #cc6933; }
-  button.muted { background: #2a2f3b; }
-  button:disabled { opacity: 0.5; cursor: not-allowed; }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
-  .radio-group { display: flex; gap: 12px; margin-top: 4px; }
-  .radio-group label { color: var(--ink); font-size: 13px; display: inline-flex; align-items: center; gap: 4px; margin: 0; }
-  .status { font-size: 12px; color: var(--muted); margin-top: 8px; min-height: 16px; }
-  .status.err { color: var(--bad); }
-  .status.ok { color: var(--ok); }
-  .note { font-size: 11px; color: var(--muted); margin-top: 10px; padding: 6px 8px; background: #12151c; border-left: 2px solid #3a4254; border-radius: 2px; }
-  .before-ts { font-size: 11px; color: var(--muted); margin-top: 6px; font-family: ui-monospace, Menlo, Consolas, monospace; }
-  .canvas-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
-  .empty { color: var(--muted); font-style: italic; font-size: 12px; padding: 20px; text-align: center; }
-</style></head><body>
-
-<header>
-  <h1>live-inference dashboard</h1>
-  <span class="pill" id="mode-pill">—</span>
-  <span class="pill ok" id="torque-pill">torque: on</span>
-  <span class="pill" id="joint-pill">joint: —</span>
-  <span class="pill" id="model-pill">model: —</span>
-  <span class="pill" id="ckpt-pill">ckpt: —</span>
-</header>
-
-<main>
-  <div class="panel">
-    <h2>Controls</h2>
-
-    <label for="model-select">Model</label>
-    <select id="model-select">
-      <option value="learner">learner (live from registry)</option>
-      <option value="baseline">baseline (pre-learner)</option>
-    </select>
-    <div class="note" id="model-note"></div>
-
-    <label for="joint-select">Joint</label>
-    <select id="joint-select"></select>
-    <div class="note" id="joint-note"></div>
-
-    <label>Action</label>
-    <div class="radio-group">
-      <label><input type="radio" name="action" value="1" checked> move+</label>
-      <label><input type="radio" name="action" value="2"> move-</label>
-      <label><input type="radio" name="action" value="3"> hold</label>
-    </div>
-
-    <div class="row">
-      <button class="primary" id="btn-predict">Predict</button>
-      <button class="primary" id="btn-execute">Execute on robot</button>
-      <button class="muted" id="btn-clear">Clear before</button>
-    </div>
-    <div class="before-ts" id="before-ts">before: (none captured)</div>
-    <div class="status" id="status"></div>
-
-    <label style="margin-top: 18px;">Joint torque</label>
-    <div class="row">
-      <button class="warn" id="btn-relax">Relax joints</button>
-      <button class="primary" id="btn-lock">Lock joints</button>
-    </div>
-  </div>
-
-  <div>
-    <div class="panel" style="margin-bottom: 14px;">
-      <div class="canvas-label">Predicted canvas <span style="color:var(--muted);font-transform:none;text-transform:none;">(before | action_sep | predicted)</span></div>
-      <div id="predicted-wrap"><div class="empty">(click Predict)</div></div>
-    </div>
-    <div class="panel">
-      <div class="canvas-label">Actual canvas <span style="text-transform:none;">(before | action_sep | actual)</span></div>
-      <div id="actual-wrap"><div class="empty">(click Execute)</div></div>
-    </div>
-  </div>
-</main>
-
-<script>
-const JOINTS = __JOINTS__;
-const CONTROL_JOINT = "__CONTROL_JOINT__";
-const MODE = "__MODE__";
-const LEARNER_CKPT = "__LEARNER_CKPT__";
-const BASELINE_CKPT = "__BASELINE_CKPT__";
-const HAS_BASELINE = __HAS_BASELINE__;
-const INITIAL_MODEL = "__INITIAL_MODEL__";
-
-document.getElementById("mode-pill").textContent = "mode: " + MODE;
-document.getElementById("joint-pill").textContent = "joint: " + CONTROL_JOINT;
-
-function shortCkpt(p) {
-  if (!p) return "—";
-  const parts = p.replace(/\\/g, "/").split("/");
-  return parts.slice(-2).join("/");
-}
-function updateModelPills(label, ckpt) {
-  document.getElementById("model-pill").textContent = "model: " + label;
-  document.getElementById("ckpt-pill").textContent = "ckpt: " + shortCkpt(ckpt);
-  document.getElementById("model-pill").className = "pill " + (label === "learner" ? "ok" : "");
-}
-updateModelPills(INITIAL_MODEL, INITIAL_MODEL === "baseline" ? BASELINE_CKPT : LEARNER_CKPT);
-
-const modelSelect = document.getElementById("model-select");
-modelSelect.value = INITIAL_MODEL;
-if (!HAS_BASELINE) {
-  // Disable the baseline option if no baseline path was configured.
-  for (const opt of modelSelect.options) {
-    if (opt.value === "baseline") { opt.disabled = true; opt.textContent += " (not configured — pass --baseline-checkpoint)"; }
-  }
-}
-function updateModelNote() {
-  const note = document.getElementById("model-note");
-  const v = modelSelect.value;
-  if (v === "learner") {
-    note.textContent = "Live checkpoint from the autonomous-learner registry: " + LEARNER_CKPT;
-    note.style.borderLeftColor = "#3a4254";
-  } else {
-    note.textContent = "Pre-learner baseline: " + BASELINE_CKPT;
-    note.style.borderLeftColor = "#3a4254";
-  }
-}
-updateModelNote();
-modelSelect.addEventListener("change", async () => {
-  updateModelNote();
-  const chosen = modelSelect.value;
-  setStatus("loading " + chosen + " model (this may take 10-30s)...", "");
-  try {
-    const res = await postJSON("/api/set_model", {model: chosen});
-    updateModelPills(res.active_model, res.active_checkpoint);
-    setStatus("loaded model: " + res.active_model, "ok");
-  } catch (e) {
-    setStatus("model switch failed: " + e.message, "err");
-    // roll the dropdown back so UI matches server state
-    modelSelect.value = INITIAL_MODEL;
-    updateModelNote();
-  }
-});
-
-const jointSelect = document.getElementById("joint-select");
-for (const j of JOINTS) {
-  const opt = document.createElement("option");
-  opt.value = j;
-  opt.textContent = j;
-  if (j === CONTROL_JOINT) opt.selected = true;
-  jointSelect.appendChild(opt);
-}
-
-function updateJointNote() {
-  const j = jointSelect.value;
-  const note = document.getElementById("joint-note");
-  if (j === CONTROL_JOINT) {
-    note.textContent = "Model was trained on this joint — predictions are in-distribution.";
-    note.style.borderLeftColor = "#3a4254";
-  } else {
-    note.textContent = "Off-joint QA probe: the world model was trained on '" + CONTROL_JOINT + "', so predictions on this joint may be out-of-distribution.";
-    note.style.borderLeftColor = "#b35a2e";
-  }
-}
-jointSelect.addEventListener("change", updateJointNote);
-updateJointNote();
-
-function currentAction() {
-  const el = document.querySelector('input[name=action]:checked');
-  return el ? parseInt(el.value, 10) : 3;
-}
-
-function setStatus(msg, cls) {
-  const el = document.getElementById("status");
-  el.textContent = msg;
-  el.className = "status " + (cls || "");
-}
-
-function setBeforeTs(ts) {
-  const el = document.getElementById("before-ts");
-  if (ts == null) {
-    el.textContent = "before: (none captured)";
-  } else {
-    const d = new Date(ts * 1000);
-    el.textContent = "before captured at: " + d.toLocaleTimeString();
-  }
-}
-
-function setTorque(on) {
-  const pill = document.getElementById("torque-pill");
-  pill.textContent = "torque: " + (on ? "on" : "off");
-  pill.className = on ? "pill ok" : "pill bad";
-}
-
-async function postJSON(url, body) {
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(body || {}),
-  });
-  const t = await r.text();
-  let j;
-  try { j = JSON.parse(t); } catch { j = {error: t}; }
-  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
-  return j;
-}
-
-function renderCanvas(wrapId, token, meta) {
-  const w = document.getElementById(wrapId);
-  if (!token) { w.innerHTML = '<div class="empty">(no canvas)</div>'; return; }
-  w.innerHTML = '<img class="canvas" src="/canvas/' + token + '?t=' + Date.now() + '"/>' +
-    (meta ? '<div class="before-ts">' + meta + '</div>' : '');
-}
-
-document.getElementById("btn-predict").addEventListener("click", async () => {
-  setStatus("predicting...", "");
-  const btn = document.getElementById("btn-predict");
-  btn.disabled = true;
-  try {
-    const res = await postJSON("/api/predict", {
-      action: currentAction(), joint: jointSelect.value,
-    });
-    setBeforeTs(res.before_captured_at);
-    renderCanvas("predicted-wrap", res.canvas_token, "action=" + currentAction() + ", joint=" + jointSelect.value);
-    setStatus("predicted.", "ok");
-  } catch (e) {
-    setStatus("predict failed: " + e.message, "err");
-  } finally {
-    btn.disabled = false;
-  }
-});
-
-document.getElementById("btn-execute").addEventListener("click", async () => {
-  if (!confirm("Execute on the real robot?")) return;
-  setStatus("executing...", "");
-  const btn = document.getElementById("btn-execute");
-  btn.disabled = true;
-  try {
-    const res = await postJSON("/api/execute", {
-      action: currentAction(), joint: jointSelect.value,
-    });
-    setBeforeTs(null);  // execute clears the before
-    renderCanvas("actual-wrap", res.canvas_token, "action=" + currentAction() + ", joint=" + jointSelect.value);
-    setStatus("executed.", "ok");
-  } catch (e) {
-    setStatus("execute failed: " + e.message, "err");
-  } finally {
-    btn.disabled = false;
-  }
-});
-
-document.getElementById("btn-clear").addEventListener("click", async () => {
-  try {
-    await postJSON("/api/clear_before", {});
-    setBeforeTs(null);
-    setStatus("cleared before.", "ok");
-  } catch (e) {
-    setStatus("clear failed: " + e.message, "err");
-  }
-});
-
-document.getElementById("btn-relax").addEventListener("click", async () => {
-  setStatus("relaxing joints...", "");
-  try {
-    await postJSON("/api/relax", {});
-    setTorque(false);
-    setStatus("joints relaxed — move by hand.", "ok");
-  } catch (e) {
-    setStatus("relax failed: " + e.message, "err");
-  }
-});
-
-document.getElementById("btn-lock").addEventListener("click", async () => {
-  setStatus("locking joints...", "");
-  try {
-    await postJSON("/api/lock", {});
-    setTorque(true);
-    setStatus("joints locked at current position.", "ok");
-  } catch (e) {
-    setStatus("lock failed: " + e.message, "err");
-  }
-});
-</script>
-</body></html>
-"""
+INDEX_HTML = (Path(__file__).parent / "templates" / "live_inference.html").read_text(encoding="utf-8")
 
 
 # --------------------------------------------------------------- handler ---
@@ -574,7 +256,10 @@ def make_handler(
             motor_before, motor_after,
             meta=hw.predictor.meta, label=label, mse=mse,
         )
-        path = _save_canvas(canvas, canvas_out_dir, prefix)
+        canvas_out_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S") + f"_{secrets.token_hex(3)}"
+        path = canvas_out_dir / f"{prefix}_{ts}.png"
+        Image.fromarray(canvas).save(path)
         return _mint_token(path)
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -725,15 +410,12 @@ def make_handler(
         def _capture_before(self) -> None:
             """Populate state.before_* from a fresh observation if not set.
 
-            All stored arrays are copied so downstream mutation (e.g. the
-            predictor's input normalization) can't corrupt the "before"
-            frame that Execute will later reuse.
+            Arrays are copied so downstream mutation (e.g. the predictor's
+            input normalization) can't corrupt the frame Execute reuses.
             """
             if state.before_ctx is not None:
                 return
-            cameras, motor, ctx = hw.observe()
-            state.before_cameras = {k: np.asarray(v).copy()
-                                    for k, v in cameras.items()}
+            _cams, motor, ctx = hw.observe()
             state.before_motor = motor.copy()
             state.before_ctx = ctx.copy()
             state.before_ts = time.time()

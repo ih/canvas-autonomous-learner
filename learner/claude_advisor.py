@@ -182,6 +182,10 @@ def run_advisor(
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            # Force UTF-8 in/out so unicode in prompts (e.g. arrows,
+            # em-dashes) doesn't crash the advisor on Windows cp1252.
+            encoding="utf-8",
+            errors="replace",
         )
     except (OSError, FileNotFoundError) as e:
         if event_log is not None:
@@ -534,6 +538,7 @@ def snapshot_run_context(
     claude_max_consecutive_retrains: int = 5,
     last_scene_change: Optional[dict] = None,
     pending_explore_overrides: Optional[dict] = None,
+    pending_novelty_report: Optional[dict] = None,
 ) -> dict:
     """Assemble the JSON-serializable context dict `build_think_prompt`
     consumes. Pure function — no side effects."""
@@ -572,6 +577,7 @@ def snapshot_run_context(
         },
         "last_scene_change": last_scene_change,
         "pending_explore_overrides": pending_explore_overrides or {},
+        "pending_novelty_report": pending_novelty_report or None,
         "recent_action_canvas_paths": recent_canvases,
     }
 
@@ -742,34 +748,102 @@ That tells you where to focus the next EXPLORE, retrain, or tau tweak.
 
 ## What to think about
 
-1. Compare `current_locked_val_mse` to `arm_a_locked_val_mse`. Is the gap
+1. **Diagnose the binding constraint before choosing a lever.** In one
+   sentence each, state whether *capacity*, *compute*, or *data* is the
+   primary limit right now, and cite specific evidence from the snapshot:
+
+   - **Capacity-bound** signals: multiple from-scratch retrains on the
+     same architecture yielding shrinking gains; train_loss plateau while
+     val_loss is still dropping (underfit); same recipe tried 3+ times
+     without breakthrough. -> Lever: bump `training.depth` /
+     `training.embed_dim` / `training.num_heads` with `from_scratch: true`.
+   - **Compute-bound** signals: last training curve's `best_val` was still
+     improving at the epoch cutoff; `--early-stop-patience` never
+     triggered; the LR schedule ran out of budget before converging. ->
+     Lever: more `cadence.cold_start_epochs` / `cadence.ft_epochs`, or
+     change `training.lr_schedule`.
+   - **Data-bound** signals: growing train/val gap (overfitting);
+     `locked_val_mse` regresses after retraining on unchanged data;
+     per-joint breakdown shows one joint saturated while another is still
+     learning; recent scene perturbations invalidate prior episodes. ->
+     Lever: `explore` (new episodes), rebalance exploration toward the
+     lagging joint, or `idle` to request a scene perturbation.
+
+   **You MUST name one of the three as the primary constraint in your
+   `reason` field** (use the literal tokens "capacity-bound",
+   "compute-bound", or "data-bound" somewhere in `reason`). If the same
+   constraint has been named in the last 3 consecutive cycles and each
+   delivered <30% of the prior cycle's improvement, that is a signal your
+   diagnosis was wrong — pivot to a different axis this cycle even if it
+   feels higher-risk.
+
+2. Compare `current_locked_val_mse` to `arm_a_locked_val_mse`. Is the gap
    closing? Has it stalled?
-2. Look at `last_training_curve` (`train_loss`, `val_loss`, `best_val`).
+3. Look at `last_training_curve` (`train_loss`, `val_loss`, `best_val`).
    Did the last training run overfit, underfit, or converge cleanly?
-3. Look at `recent_verifies`. Is `mean_err` moving in the right direction
+4. Look at `recent_verifies`. Is `mean_err` moving in the right direction
    relative to `knobs.tau_low` and `knobs.tau_high`?
-4. Look at `curriculum`. Are we stuck at a narrow range? Should we force-
+5. Look at `curriculum`. Are we stuck at a narrow range? Should we force-
    expand, force a stage transition, or narrow back?
-5. Look at `recent_gpu_signals`. If it contains a `training_memory_abort`
+6. Look at `recent_gpu_signals`. If it contains a `training_memory_abort`
    or `training_stalled` event from your last cycle, the orchestrator
    aborted because the configuration exceeded or nearly exceeded 32 GB
    VRAM. Check `summary.used_mb` / `summary.total_mb` to see the peak.
    Reduce `training.batch_size` first, or shrink architecture dims (with
    `from_scratch: true`) before retrying. If there are recurring
    `inference_oom` entries, verify is also memory-bound.
-6. Look at `recent_advisor_decisions` — this is YOUR own history across
+7. Look at `recent_advisor_decisions` — this is YOUR own history across
    prior THINK cycles (reason, next_state, every override you applied).
    Before proposing the same override again, check whether you already
    tried it: if a recent `training_overrides` bump didn't lower val_loss
    or caused an abort, don't repeat it. Look for patterns you're stuck
    in (alternating explore/retrain with no improvement) and break them
    with a genuinely different approach.
-7. If training curves say "needs more data", pick `explore`. If they say
-   "wrong hyperparameters", pick `retrain` with `training_overrides`. If
-   they say "need a different scene", pick `idle` with clear instructions.
-8. Respect `advisor_budget.claude_max_consecutive_retrains` — after that
+8. Your diagnosis from step 1 constrains the routing choice: capacity-bound
+   -> `retrain` with a `from_scratch: true` architecture override; compute-
+   bound -> `retrain` with longer epochs or different LR schedule; data-
+   bound -> `explore` or `idle` for a scene perturbation. Don't pick
+   `explore` if you named capacity as binding.
+9. Respect `advisor_budget.claude_max_consecutive_retrains` — after that
    many retrains in a row without new data, the orchestrator will force
    a VERIFY anyway.
+10. **If `pending_novelty_report` is present**, you are being called
+    immediately after an EXPLORE burst. Its fields tell you whether the
+    just-collected batch is actually different from prior data:
+
+    - `mean_frame_mse_vs_prior_latest` — scalar in [0, 1]. Very small
+      (<1e-3) means the new batch's average canvas looks nearly
+      identical to the most recent prior batch's average canvas
+      (redundant scene, similar poses). Larger values (>5e-3) indicate
+      a real shift — novel poses, scene rearrangement, or lighting
+      change. Use this as the PRIMARY cheap signal.
+    - `new_frame_stats` / `prior_frame_stats` — brightness + stddev of
+      each mean frame. Large mean shift => lighting changed; large
+      stddev shift => scene complexity changed.
+    - `sample_canvas_paths` — (tag, path) pairs you can `Read` with
+      your vision model to confirm visually. One from the new batch,
+      one from the nearest prior batch. If the scalar is ambiguous,
+      compare them visually before deciding.
+
+    What to do with it:
+    - **High novelty** (MSE >5e-3 or clear visual difference): retrain
+      is worthwhile. Set `training_overrides` + `from_scratch` based on
+      your capacity/compute/data diagnosis (step 1) and proceed.
+    - **Low novelty** (MSE <1e-3, frames look the same): this batch is
+      redundant. Consider routing `explore` again with different ranges
+      / joint biases to cover new state-space, OR `idle` to request a
+      scene perturbation. Retraining on redundant data wastes compute.
+    - **Mid novelty**: retrain but keep the override conservative
+      (fine-tune, not from-scratch) — save the nuclear option for when
+      you have genuinely new data to feed it.
+
+    **Your routing decision after an EXPLORE must predict the
+    subsequent retrain's parameters** — the orchestrator transitions
+    EXPLORE -> THINK -> RETRAIN without re-entering THINK. So if you
+    want a cold-start retrain on the new data, set both `next_state:
+    "retrain"` AND `from_scratch: true` AND any `training_overrides`
+    you want. If you want to skip the retrain, route to `explore` or
+    `idle` instead.
 
 Default next state (what the orchestrator would do if you returned
 `{{"next_state":"{default_next}"}}`): **{default_next}**.

@@ -296,6 +296,25 @@ def _read_eval_visual_mse(eval_output_dir: Path) -> Optional[float]:
     return float(val) if val is not None else None
 
 
+def _motor_bounds_arg(cfg) -> list[str]:
+    """Return `[--motor-bounds-json, <json>]` if cfg.training.motor_bounds
+    is set, else `[]`. Shared by both `build_canvases` and `combine_datasets`
+    so every offline canvas step uses identical normalization bounds.
+    """
+    training = getattr(cfg, "training", None)
+    mb = getattr(training, "motor_bounds", None) if training is not None else None
+    if mb is None:
+        return []
+    # SimpleNamespace or dict — normalize to dict for JSON
+    if hasattr(mb, "__dict__"):
+        mb_dict = {k: list(v) for k, v in vars(mb).items() if v is not None}
+    else:
+        mb_dict = {k: list(v) for k, v in dict(mb).items() if v is not None}
+    if not mb_dict:
+        return []
+    return ["--motor-bounds-json", json.dumps(mb_dict)]
+
+
 def build_canvases(
     cfg,
     new_lerobot_dir: str | Path,
@@ -305,13 +324,15 @@ def build_canvases(
     cwm = Path(cfg.paths.canvas_world_model)
     python_exe = cfg.paths.python or sys.executable
     output_dir = Path(output_dir)
+    cmd = [
+        python_exe,
+        "create_dataset.py",
+        "--lerobot-path", str(new_lerobot_dir),
+        "--output", str(output_dir),
+    ]
+    cmd.extend(_motor_bounds_arg(cfg))
     _run(
-        [
-            python_exe,
-            "create_dataset.py",
-            "--lerobot-path", str(new_lerobot_dir),
-            "--output", str(output_dir),
-        ],
+        cmd,
         cwd=cwm,
         event_log=event_log,
         tag="create_dataset",
@@ -330,6 +351,7 @@ def combine_datasets(
     cmd = [python_exe, "combine_datasets.py", "--inputs"]
     cmd.extend(str(p) for p in inputs)
     cmd.extend(["--output", str(output_dir)])
+    cmd.extend(_motor_bounds_arg(cfg))
     _run(cmd, cwd=cwm, event_log=event_log, tag="combine_datasets")
     return Path(output_dir)
 
@@ -572,9 +594,41 @@ def retrain_cumulative(
         )
 
         locked_val_mse = None
-        if locked_val_dataset is not None:
+        if locked_val_dataset is not None and Path(locked_val_dataset).exists():
             locked_val_mse = evaluate(
                 cfg, new_ckpt, locked_val_dataset, eval_out_locked,
+                event_log=event_log,
+            )
+        elif locked_val_dataset is not None and event_log is not None:
+            event_log.log(
+                "locked_val_skipped",
+                reason="dataset path not found",
+                path=str(locked_val_dataset),
+            )
+
+        # Per-joint locked-val evaluations — optional. When the config
+        # carries locked_val_shoulder / locked_val_elbow paths to
+        # separate held-out corpora, evaluate each so the learner can
+        # track joint-specific learning curves for the two-joint
+        # experiment. The advisor does NOT see these values (real-run
+        # fidelity — a production run has no locked val), but they're
+        # logged to the registry + events for post-hoc analysis.
+        # Missing paths are silently skipped so the experiment can start
+        # before the val corpus has been recorded.
+        locked_val_shoulder = None
+        locked_val_elbow = None
+        shoulder_path = getattr(cfg.paths, "locked_val_shoulder", None)
+        elbow_path = getattr(cfg.paths, "locked_val_elbow", None)
+        if shoulder_path and Path(shoulder_path).exists():
+            locked_val_shoulder = evaluate(
+                cfg, new_ckpt, shoulder_path,
+                Path(cfg.paths.runs_dir) / f"eval_locked_shoulder_{stamp}",
+                event_log=event_log,
+            )
+        if elbow_path and Path(elbow_path).exists():
+            locked_val_elbow = evaluate(
+                cfg, new_ckpt, elbow_path,
+                Path(cfg.paths.runs_dir) / f"eval_locked_elbow_{stamp}",
                 event_log=event_log,
             )
     except SubprocessMemoryAbort as e:
@@ -615,6 +669,8 @@ def retrain_cumulative(
             merged_dataset=str(merged_dir),
             train_val_mse=train_val_mse,
             locked_val_mse=locked_val_mse,
+            locked_val_shoulder=locked_val_shoulder,
+            locked_val_elbow=locked_val_elbow,
             num_canvas_dirs=len(dirs),
             epochs=epochs,
             from_scratch=(resume_checkpoint is None),
@@ -624,6 +680,8 @@ def retrain_cumulative(
         "merged_dataset": str(merged_dir),
         "train_val_mse": train_val_mse,
         "locked_val_mse": locked_val_mse,
+        "locked_val_shoulder": locked_val_shoulder,
+        "locked_val_elbow": locked_val_elbow,
     }
 
 

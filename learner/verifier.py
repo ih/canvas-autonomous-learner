@@ -103,9 +103,28 @@ def verify_batch(
     if num_probes <= 0:
         return []
 
-    scripts = _plan_probe_script(cfg, window, curriculum, num_probes)
+    # Pooled-joint mode: the recorder randomizes the target joint per
+    # episode (vary_target_joint=true). Pre-specified (start_pos,
+    # direction) tuples don't map cleanly when we don't know which joint
+    # the recorder will pick, so we skip the probe_script and let the
+    # recorder use its own randomized starts inside each joint's range.
+    # The acting joint for each probe is recovered from the motor delta
+    # in process_recorded_episode and logged per-probe.
+    pooled_verify = bool(
+        getattr(getattr(cfg, "explore", None), "vary_target_joint", False)
+        and getattr(getattr(cfg, "explore", None), "joints", None)
+    )
+    if pooled_verify:
+        scripts = None
+    else:
+        scripts = _plan_probe_script(cfg, window, curriculum, num_probes)
     if event_log is not None:
-        event_log.log("verify_plan", cycle=cycle, probe_script=scripts)
+        event_log.log(
+            "verify_plan",
+            cycle=cycle,
+            probe_script=scripts,
+            pooled=pooled_verify,
+        )
 
     # Joint-range override: keep the primary free across the curriculum's
     # active range (the probe_script will pin each episode's start within
@@ -117,6 +136,10 @@ def verify_batch(
 
     hardware.disconnect()
     try:
+        verify_prefix = (
+            getattr(getattr(cfg, "verify", None), "repo_id_prefix", None)
+            or "auto/autonomous-verify"
+        )
         dataset_dir = explorer.collect_batch(
             cfg,
             num_probes,
@@ -124,7 +147,7 @@ def verify_batch(
             event_log=event_log,
             joint_range_override=joint_range_override,
             probe_script=scripts,
-            repo_id_prefix="auto/autonomous-verify",
+            repo_id_prefix=verify_prefix,
             event_tag="verify_record_start",
         )
     finally:
@@ -198,6 +221,9 @@ def verify_batch(
                 mse=probe.mse,
                 state_key=probe.state_key,
                 motor_state=list(probe.motor_state or []),
-                target_position=scripts[probe_idx][0],
+                acting_joint_idx=probe.acting_joint_idx,
+                target_position=(
+                    scripts[probe_idx][0] if scripts is not None else None
+                ),
             )
     return probes

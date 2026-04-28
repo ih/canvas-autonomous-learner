@@ -20,6 +20,8 @@ _PATH_KEYS = {
     "base_canvas",
     "val_dataset",
     "locked_val_dataset",
+    "locked_val_shoulder",
+    "locked_val_elbow",
     "live_checkpoint",
     "ckpt_dir",
     "canvas_out",

@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import claude_advisor, explorer, trainer_driver, verifier
+from . import claude_advisor, explorer, novelty, trainer_driver, verifier
 from .budget import dynamic_explore_batch_size
 from .events import EventLog
 from .hardware import Hardware
@@ -137,13 +137,27 @@ def main_loop(
     _install_signal_handlers(shutdown)
     stop = shutdown_check or (lambda: shutdown.requested)
 
-    if event_log is None:
-        event_log = EventLog(cfg.paths.runs_dir)
-    examples_dir = Path(cfg.paths.runs_dir) / f"examples_{event_log.session}"
-    events_path = Path(cfg.paths.runs_dir) / f"events_{event_log.session}.jsonl"
+    # Ensure every per-run dir exists so a fresh config whose run root
+    # does not yet exist (e.g. a new experiment arm) just works without
+    # requiring the user to pre-create directories.
+    for _attr in ("runs_dir", "ckpt_dir", "canvas_out"):
+        _p = getattr(cfg.paths, _attr, None)
+        if _p:
+            Path(_p).mkdir(parents=True, exist_ok=True)
 
     if registry is None:
         registry = Registry(cfg.paths.registry_file)
+    # Pin session name across restarts so dashboard history (rolling MSE
+    # chart, wall-clock duration, event stream) survives a kill/resume.
+    session_name = registry.session_name()
+    if session_name is None:
+        session_name = time.strftime("%Y%m%d_%H%M%S")
+        registry.set_session_name(session_name)
+    if event_log is None:
+        event_log = EventLog(cfg.paths.runs_dir, session=session_name)
+    examples_dir = Path(cfg.paths.runs_dir) / f"examples_{event_log.session}"
+    events_path = Path(cfg.paths.runs_dir) / f"events_{event_log.session}.jsonl"
+
     if hardware is None:
         hardware = Hardware(cfg, dry_run=getattr(cfg, "dry_run", False))
 
@@ -230,6 +244,24 @@ def main_loop(
             has_secondary=curriculum.secondary_config is not None,
         )
 
+    # Honor any advisor decision that was persisted across a prior crash.
+    pending = registry.pending_advisor_decision()
+    if pending and pending.get("verb") == "terminate":
+        event_log.log(
+            "experiment_terminate_pending_replay",
+            reason=pending.get("reason"),
+            persisted_at=pending.get("t"),
+            persisted_cycle=pending.get("cycle"),
+        )
+        registry.set_pending_advisor_decision(None)
+        registry.set_experiment_status("terminated")
+        return {
+            "reason": "claude_terminate_resumed",
+            "reason_detail": str(pending.get("reason", "")),
+            "cycle": cycle,
+            "total_eps": total_eps,
+        }
+
     registry.set_experiment_status("running")
     event_log.log(
         "experiment_start",
@@ -271,6 +303,11 @@ def main_loop(
     last_verify_mean_err: Optional[float] = None
     iteration = 0
     new_lerobot_dirs: list[Path] = []
+    # Canvas dirs for the most recent EXPLORE, built upfront so the
+    # advisor can inspect them at THINK time. RETRAIN reuses these and
+    # skips rebuilding.
+    post_explore_canvas_dirs: list[Path] = []
+    pending_novelty_report: Optional[dict] = None
 
     # THINK-phase mutable state
     pending_explore_overrides: Optional[dict] = None
@@ -402,6 +439,7 @@ def main_loop(
                     claude_max_consecutive_retrains=claude_max_consecutive_retrains,
                     last_scene_change=last_scene_change,
                     pending_explore_overrides=pending_explore_overrides,
+                    pending_novelty_report=pending_novelty_report,
                 )
                 prompt = claude_advisor.build_think_prompt(context)
                 try:
@@ -471,6 +509,15 @@ def main_loop(
                 )
 
                 if canonical == "terminate":
+                    # Persist the terminate decision BEFORE acting on it so
+                    # a crash in the tiny window between advisor return and
+                    # orchestrator shutdown can be replayed on resume.
+                    registry.set_pending_advisor_decision({
+                        "verb": "terminate",
+                        "reason": str(advice.get("reason", "")),
+                        "t": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "cycle": cycle,
+                    })
                     termination["reason"] = "claude_terminate"
                     termination["reason_detail"] = str(advice.get("reason", ""))
                     break
@@ -756,29 +803,86 @@ def main_loop(
                     termination["reason"] = "explore_failed"
                     break
 
-                state = State.RETRAIN
-                continue
-
-            # ---------------------------------------------------- RETRAIN
-            if state == State.RETRAIN:
-                new_canvas_dirs: list[Path] = []
+                # Build canvases NOW (before THINK) so the advisor can
+                # inspect them and a novelty report can be computed.
+                # The RETRAIN branch will reuse these (skip rebuild).
                 canvas_out = Path(cfg.paths.canvas_out)
                 try:
                     for d in new_lerobot_dirs:
                         out_dir = canvas_out / f"batch_{_stamp()}_c{cycle}_{d.name}"
                         build_canvases(cfg, d, out_dir, event_log=event_log)
-                        new_canvas_dirs.append(out_dir)
+                        post_explore_canvas_dirs.append(out_dir)
                 except Exception as e:
                     event_log.log("build_canvases_failed", error=str(e), cycle=cycle)
                     termination["reason"] = "build_canvases_failed"
                     break
 
-                for d in new_canvas_dirs:
+                # Novelty report: compare new canvas dirs to prior
+                # accumulated dirs BEFORE appending the new ones.
+                try:
+                    pending_novelty_report = novelty.compute_novelty_report(
+                        new_canvas_dirs=post_explore_canvas_dirs,
+                        prior_canvas_dirs=[Path(p) for p in accumulated_dirs],
+                    )
+                    event_log.log(
+                        "novelty_report",
+                        mean_frame_mse_vs_prior_latest=(
+                            pending_novelty_report.get("mean_frame_mse_vs_prior_latest")
+                        ),
+                        num_new_dirs=pending_novelty_report.get("num_new_dirs"),
+                        num_prior_dirs=pending_novelty_report.get("num_prior_dirs"),
+                    )
+                except Exception as e:
+                    event_log.log("novelty_report_failed", error=str(e))
+                    pending_novelty_report = None
+
+                # Now register the new canvas dirs so subsequent
+                # retrains see them.
+                for d in post_explore_canvas_dirs:
                     accumulated_dirs.append(str(d))
                     registry.append_canvas_dir(d, episodes_added=0)
                 registry.save_range_state(
                     curriculum.to_registry_snapshot() if curriculum else {}
                 )
+
+                # Route through THINK so the advisor can decide whether
+                # to retrain immediately (accept the new data), explore
+                # more (redundant batch, collect different coverage),
+                # or take a different path entirely.
+                pending_default_next_state = State.RETRAIN
+                state = State.THINK
+                continue
+
+            # ---------------------------------------------------- RETRAIN
+            if state == State.RETRAIN:
+                # If the most recent EXPLORE pre-built canvases (new
+                # flow), skip rebuild and jump straight to training.
+                # Otherwise (advisor-forced retrain with no new data,
+                # or legacy path) build canvases here as before.
+                if post_explore_canvas_dirs:
+                    # Already built and registered at end of EXPLORE.
+                    # Clear so we don't re-use them on subsequent
+                    # retrains.
+                    post_explore_canvas_dirs = []
+                else:
+                    new_canvas_dirs: list[Path] = []
+                    canvas_out = Path(cfg.paths.canvas_out)
+                    try:
+                        for d in new_lerobot_dirs:
+                            out_dir = canvas_out / f"batch_{_stamp()}_c{cycle}_{d.name}"
+                            build_canvases(cfg, d, out_dir, event_log=event_log)
+                            new_canvas_dirs.append(out_dir)
+                    except Exception as e:
+                        event_log.log("build_canvases_failed", error=str(e), cycle=cycle)
+                        termination["reason"] = "build_canvases_failed"
+                        break
+
+                    for d in new_canvas_dirs:
+                        accumulated_dirs.append(str(d))
+                        registry.append_canvas_dir(d, episodes_added=0)
+                    registry.save_range_state(
+                        curriculum.to_registry_snapshot() if curriculum else {}
+                    )
 
                 epochs, from_scratch = _cycle_epochs(cfg, cycle)
                 # Claude-forced cold start overrides cycle 0's auto-cold.
@@ -975,6 +1079,11 @@ def main_loop(
         except Exception as e:
             event_log.log("goto_home_failed", phase="shutdown", error=str(e))
         registry.set_experiment_status(termination.get("reason", "unknown"))
+        # Clear any pending advisor decision once we've cleanly shut down —
+        # a subsequent startup should not replay a terminate that has
+        # already been honored.
+        if registry.pending_advisor_decision() is not None:
+            registry.set_pending_advisor_decision(None)
         event_log.log("experiment_done", **termination)
         event_log.log("shutdown")
 

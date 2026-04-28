@@ -37,6 +37,11 @@ class Registry:
                 "range_active": None,
                 "range_stable_cycles": 0,
                 "range_history": [],
+                # Pinned session name (set on first startup so dashboard
+                # history survives learner restarts) and any pending
+                # advisor-issued verb awaiting orchestrator action.
+                "session_name": None,
+                "pending_advisor_decision": None,
             })
 
     # --------------------------------------------------------------- internals
@@ -151,6 +156,25 @@ class Registry:
     def reset_guard_rejections(self) -> None:
         data = self._read()
         data["consecutive_guard_rejections"] = 0
+        self._write(data)
+
+    # ------------------------------------------------- session + advisor state
+
+    def session_name(self) -> str | None:
+        return self._read().get("session_name")
+
+    def set_session_name(self, name: str) -> None:
+        data = self._read()
+        data["session_name"] = str(name)
+        self._write(data)
+
+    def pending_advisor_decision(self) -> dict | None:
+        v = self._read().get("pending_advisor_decision")
+        return dict(v) if isinstance(v, dict) else None
+
+    def set_pending_advisor_decision(self, decision: dict | None) -> None:
+        data = self._read()
+        data["pending_advisor_decision"] = dict(decision) if decision else None
         self._write(data)
 
     # ---------------------------------------------- range curriculum state

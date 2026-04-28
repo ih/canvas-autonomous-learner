@@ -293,7 +293,7 @@ def collect_batch(
     joint_range_override: dict[str, tuple[float, float]] | None = None,
     randomize_primary_start: bool | None = None,
     probe_script: list[tuple[float, str]] | None = None,
-    repo_id_prefix: str = "auto/autonomous-explore",
+    repo_id_prefix: str | None = None,
     event_tag: str = "explore_start",
 ) -> Path | None:
     """Run one EXPLORE burst and return the LeRobot v3.0 dataset path.
@@ -318,6 +318,9 @@ def collect_batch(
     expected to disconnect its hardware before calling this.
     """
     session = _session_stamp()
+    if repo_id_prefix is None:
+        repo_id_prefix = getattr(getattr(cfg, "explore", None), "repo_id_prefix", None) \
+            or "auto/autonomous-explore"
     repo_id = f"{repo_id_prefix}-{session}"
     dataset_path = _cache_path_for_repo_id(repo_id)
     if dataset_path.exists():
@@ -345,6 +348,15 @@ def collect_batch(
         f"--policy.joint_name={cfg.explore.policy_joint_name}",
         f"--policy.vary_target_joint={'true' if cfg.explore.vary_target_joint else 'false'}",
         f"--policy.position_delta={cfg.robot.step_size}",
+        *(
+            # Only emit --policy.secondary_joint_name when the caller
+            # explicitly sets it. Needed to avoid collisions when
+            # policy_joint_name matches the recorder's default secondary
+            # (elbow_flex.pos) — e.g. the locked-val recorder's elbow run.
+            [f"--policy.secondary_joint_name={cfg.explore.secondary_joint_name}"]
+            if getattr(cfg.explore, "secondary_joint_name", None)
+            else []
+        ),
         f"--policy.action_duration={cfg.explore.action_duration}",
         f"--policy.start_buffer={getattr(cfg.explore, 'start_buffer', 2.5)}",
         f"--dataset.repo_id={repo_id}",
@@ -353,8 +365,39 @@ def collect_batch(
         "--dataset.push_to_hub=false",
     ]
 
+    # When vary_target_joint=true the policy samples its target from
+    # `config.joints`. Thread that list through as a Hydra/draccus list
+    # literal: --policy.joints='[shoulder_pan.pos,elbow_flex.pos]'.
+    joints_pool = getattr(cfg.explore, "joints", None)
+    if joints_pool:
+        joints_list = list(joints_pool)
+        joints_csv = ",".join(joints_list)
+        cmd.append(f"--policy.joints=[{joints_csv}]")
+
+    # Start from any baseline ranges the config wants (e.g. pooled-joint
+    # experiments that need safe elbow limits even when the curriculum
+    # only names shoulder_pan as "active"). The orchestrator's
+    # per-sub-burst override stacks on top so the active joint's narrow
+    # bin wins for the acting joint.
+    baseline_ranges = getattr(cfg.explore, "joint_ranges", None)
+    merged_ranges: dict = {}
+    if baseline_ranges:
+        if hasattr(baseline_ranges, "__dict__"):
+            src = vars(baseline_ranges)
+        else:
+            src = dict(baseline_ranges)
+        for k, v in src.items():
+            if v is None:
+                continue
+            lo, hi = v
+            merged_ranges[str(k)] = (float(lo), float(hi))
     if joint_range_override:
-        cmd.append(f"--policy.joint_ranges={_joint_ranges_cli_arg(joint_range_override)}")
+        for k, v in joint_range_override.items():
+            lo, hi = v
+            merged_ranges[str(k)] = (float(lo), float(hi))
+
+    if merged_ranges:
+        cmd.append(f"--policy.joint_ranges={_joint_ranges_cli_arg(merged_ranges)}")
         # When a probe_script is supplied, each episode forces its own
         # primary start position, so randomize_primary_start MUST be off —
         # otherwise the policy would discard the forced start.
