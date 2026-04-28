@@ -79,10 +79,17 @@ cadence:
   probes_per_verify: 6
   window_size: 24
   settle_time: 0.5
+  # Healthy model (mean_err <= tau_high): collect base=20 episodes.
+  # Struggling model (mean_err >= 3*tau_high): scale up to 60 episodes
+  # split across max_sub_bursts=3 hot bins, weighted by per-bin MSE.
+  # min_sub_burst_size=20 floor means sub-bursting kicks in only when
+  # total episodes >= 40 (one of the bursts would otherwise drop below
+  # the floor). At 20 total you get 1 sub-burst; at 60 total you get up
+  # to 3 sub-bursts of 20 each.
   base_explore_batch_size: 20
   explore_batch_size_min: 20
-  explore_batch_size_max: 20
-  max_sub_bursts: 1
+  explore_batch_size_max: 60
+  max_sub_bursts: 3
   min_sub_burst_size: 20
   cold_start_epochs: 300
   ft_epochs: 150

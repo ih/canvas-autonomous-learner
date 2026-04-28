@@ -178,6 +178,20 @@ def plan_explore_sub_bursts(
     if max_sub_bursts <= 1:
         return [(int(total_episodes), (float(lo), float(hi)))]
 
+    # Cap max_sub_bursts so the episode budget can honor the per-sub-burst
+    # floor. Without this, a budget too small relative to the floor lets
+    # the inner allocator overrun: the last sub-burst's `n_eps =
+    # total_episodes - allocated` goes negative, the negative entry is
+    # later dropped by the floor filter, and the surviving entries —
+    # already each pinned at the floor — sum to MORE than total_episodes.
+    # Cap up front so we either return fewer sub-bursts or a single
+    # uniform fallback.
+    if min_sub_burst_size > 0:
+        max_sub_bursts_by_budget = max(1, int(total_episodes) // int(min_sub_burst_size))
+        max_sub_bursts = min(max_sub_bursts, max_sub_bursts_by_budget)
+        if max_sub_bursts <= 1:
+            return [(int(total_episodes), (float(lo), float(hi)))]
+
     # Cap n_bins so every bin is at least `min_sub_burst_width` wide.
     # Integer floor on (range_width / min_width) gives the max #bins that
     # can each honor the width. If we can only fit 1 bin, fall back to a

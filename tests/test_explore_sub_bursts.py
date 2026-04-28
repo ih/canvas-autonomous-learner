@@ -99,6 +99,43 @@ def test_sub_bursts_never_exceed_active_range():
         assert -20.0 <= lo < hi <= 20.0
 
 
+def test_total_equal_to_floor_returns_single_burst():
+    """Regression: when total_episodes == min_sub_burst_size, the planner
+    used to return multiple sub-bursts that summed to MORE than the
+    requested budget (negative last-allocation got dropped, leaving the
+    floor-pinned survivors over-committed). Cap max_sub_bursts up front
+    by the budget/floor ratio so we collapse cleanly to one sub-burst.
+    """
+    w = RollingWindow(size=20)
+    for _ in range(5):
+        w.add(_ps(0.5, 5.0))
+        w.add(_ps(0.3, -5.0))
+        w.add(_ps(0.2, 15.0))
+    out = plan_explore_sub_bursts(
+        w, (-20.0, 20.0), control_joint_idx=0, total_episodes=20,
+        max_sub_bursts=3, min_sub_burst_size=20,
+    )
+    assert len(out) == 1
+    assert sum(n for n, _ in out) == 20
+
+
+def test_total_one_floor_below_max_subbursts_caps_correctly():
+    """total=40, floor=20, max=3 → only 2 sub-bursts of 20 fit."""
+    w = RollingWindow(size=20)
+    for _ in range(5):
+        w.add(_ps(0.5, 5.0))
+        w.add(_ps(0.3, -5.0))
+        w.add(_ps(0.2, 15.0))
+    out = plan_explore_sub_bursts(
+        w, (-20.0, 20.0), control_joint_idx=0, total_episodes=40,
+        max_sub_bursts=3, min_sub_burst_size=20,
+    )
+    assert len(out) <= 2
+    assert sum(n for n, _ in out) == 40
+    for n, _ in out:
+        assert n >= 20
+
+
 def test_small_total_collapses_to_fewer_bursts():
     w = RollingWindow(size=20)
     for _ in range(5):
