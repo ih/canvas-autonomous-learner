@@ -858,7 +858,15 @@ def collect_batch_continuous(
         f"--output-repo-id={repo_id}",
     ]
 
+    # When force_joint is set, the recorder's --joints is a single-element
+    # list. Its CLI parser raises if any --joint-range refers to a joint
+    # not in that list. Filter merged_ranges accordingly so we only emit
+    # the active joint's range.
     for joint, (lo, hi) in merged_ranges.items():
+        if force_joint is not None:
+            joint_basename = joint.replace(".pos", "")
+            if joint_basename != force_joint:
+                continue
         cmd.extend(["--joint-range", str(joint), str(float(lo)), str(float(hi))])
 
     # If the config pins joints[0] for vary_target=False (single-joint
