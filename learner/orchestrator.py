@@ -225,6 +225,11 @@ def main_loop(
     prev_ckpt: str | None = registry.live_checkpoint()
     prev_train_val_mse: float | None = None
     prev_locked_val_mse: float | None = None
+    # Latest per-(joint, position-bin) MSE breakdown from the most recent
+    # accepted RETRAIN. Consumed by plan_per_joint_sub_bursts when
+    # cadence.per_joint_targeting is true. None means fall back to the 1D
+    # planner (cold start, older checkpoints, or feature disabled).
+    current_per_cell_mse: dict | None = None
 
     # Seed prev_*_val from registry history (last accepted entry) so a
     # resumed run compares against the last ACCEPTED value, not None.
@@ -695,30 +700,93 @@ def main_loop(
                 active = _active_range(curriculum, cfg)
                 active_idx = _active_joint_idx(curriculum, control_joint_idx)
                 active_jname = _active_joint_name(curriculum, control_joint)
-                sub_bursts = explorer.plan_explore_sub_bursts(
-                    window,
-                    active,
-                    control_joint_idx=active_idx,
-                    total_episodes=burst,
-                    max_sub_bursts=eff_max_sub_bursts,
-                    min_sub_burst_size=knobs.min_sub_burst_size,
-                    # Each sub-burst must be wide enough for single_action
-                    # to execute a full ±position_delta step without being
-                    # flagged as a no-op by its bound-forcing logic.
-                    min_sub_burst_width=2.0 * float(cfg.robot.step_size),
-                )
-                event_log.log(
-                    "explore_sub_bursts_planned",
-                    cycle=cycle,
-                    burst=burst,
-                    stage=curriculum.stage if curriculum is not None else None,
-                    active_joint=active_jname,
-                    sub_bursts=[
-                        {"n_eps": int(n), "range": [float(r[0]), float(r[1])]}
-                        for n, r in sub_bursts
-                    ],
-                    active_range=list(active),
-                )
+
+                # Per-joint targeting: when enabled, branch the planner.
+                # Returns `(n_eps, joint_name, range)` triples; the
+                # collect_batch loop below handles both shapes.
+                per_joint_targeting = bool(getattr(
+                    getattr(cfg, "cadence", None), "per_joint_targeting", False
+                ))
+                joint_pool: list[str] = []
+                if per_joint_targeting:
+                    raw_pool = getattr(cfg.explore, "joints", None)
+                    if raw_pool:
+                        joint_pool = [
+                            str(j).replace(".pos", "") for j in raw_pool
+                        ]
+                joint_full_ranges: dict[str, tuple[float, float]] = {}
+                if per_joint_targeting:
+                    cfg_jr = getattr(cfg.explore, "joint_ranges", None)
+                    if cfg_jr is not None:
+                        src = vars(cfg_jr) if hasattr(cfg_jr, "__dict__") else dict(cfg_jr)
+                        for k, v in src.items():
+                            if v is None:
+                                continue
+                            joint_full_ranges[str(k).replace(".pos", "")] = (
+                                float(v[0]), float(v[1]),
+                            )
+
+                if (
+                    per_joint_targeting
+                    and len(joint_pool) > 1
+                    and current_per_cell_mse is not None
+                ):
+                    per_joint_bursts = explorer.plan_per_joint_sub_bursts(
+                        per_cell_mse=current_per_cell_mse,
+                        joint_pool=joint_pool,
+                        joint_ranges=joint_full_ranges,
+                        total_episodes=burst,
+                        max_sub_bursts=eff_max_sub_bursts,
+                        min_sub_burst_size=knobs.min_sub_burst_size,
+                        min_sub_burst_width=2.0 * float(cfg.robot.step_size),
+                    )
+                    # Adapt to the (n_eps, range) shape for the loop below
+                    # while remembering per-burst joint pinning.
+                    sub_bursts = [(n, (r[0], r[1])) for n, _, r in per_joint_bursts]
+                    sub_burst_force_joints: list[str | None] = [
+                        j for _, j, _ in per_joint_bursts
+                    ]
+                    event_log.log(
+                        "explore_sub_bursts_planned",
+                        cycle=cycle,
+                        burst=burst,
+                        stage=curriculum.stage if curriculum is not None else None,
+                        active_joint=active_jname,
+                        mode="per_joint",
+                        sub_bursts=[
+                            {"n_eps": int(n), "joint": j,
+                             "range": [float(r[0]), float(r[1])]}
+                            for n, j, r in per_joint_bursts
+                        ],
+                        active_range=list(active),
+                    )
+                else:
+                    sub_bursts = explorer.plan_explore_sub_bursts(
+                        window,
+                        active,
+                        control_joint_idx=active_idx,
+                        total_episodes=burst,
+                        max_sub_bursts=eff_max_sub_bursts,
+                        min_sub_burst_size=knobs.min_sub_burst_size,
+                        # Each sub-burst must be wide enough for single_action
+                        # to execute a full ±position_delta step without being
+                        # flagged as a no-op by its bound-forcing logic.
+                        min_sub_burst_width=2.0 * float(cfg.robot.step_size),
+                    )
+                    sub_burst_force_joints = [None] * len(sub_bursts)
+                    event_log.log(
+                        "explore_sub_bursts_planned",
+                        cycle=cycle,
+                        burst=burst,
+                        stage=curriculum.stage if curriculum is not None else None,
+                        active_joint=active_jname,
+                        mode="per_active_joint" if per_joint_targeting else "default",
+                        sub_bursts=[
+                            {"n_eps": int(n), "range": [float(r[0]), float(r[1])]}
+                            for n, r in sub_bursts
+                        ],
+                        active_range=list(active),
+                    )
 
                 new_lerobot_dirs = []
 
@@ -755,10 +823,19 @@ def main_loop(
                 active_joint_key = f"{active_jname}.pos"
                 for sub_idx, (n_eps, sub_range) in enumerate(sub_bursts):
                     dataset_dir: Optional[Path] = None
+                    # Per-joint targeting pins this sub-burst to one
+                    # specific joint; the override key follows that
+                    # joint, not the curriculum's "active" joint.
+                    force_joint = sub_burst_force_joints[sub_idx] if sub_idx < len(sub_burst_force_joints) else None
                     burst_override = dict(base_override)
-                    burst_override[active_joint_key] = (
-                        float(sub_range[0]), float(sub_range[1]),
-                    )
+                    if force_joint is not None:
+                        burst_override[f"{force_joint}.pos"] = (
+                            float(sub_range[0]), float(sub_range[1]),
+                        )
+                    else:
+                        burst_override[active_joint_key] = (
+                            float(sub_range[0]), float(sub_range[1]),
+                        )
                     for attempt in range(knobs.explore_max_retries + 1):
                         if home_dict:
                             try:
@@ -767,9 +844,7 @@ def main_loop(
                                 pass
                         hardware.disconnect()
                         try:
-                            dataset_dir = collect_batch(
-                                cfg,
-                                int(n_eps),
+                            collect_kwargs = dict(
                                 window=window,
                                 event_log=event_log,
                                 joint_range_override=burst_override,
@@ -777,6 +852,20 @@ def main_loop(
                                     True if override_randomize is None
                                     else bool(override_randomize)
                                 ),
+                            )
+                            # `force_joint` is only honored by
+                            # collect_batch_continuous (streaming). The
+                            # legacy collect_batch silently drops kwargs
+                            # it doesn't recognize, so it's safe to pass
+                            # unconditionally — but we only do so when
+                            # actually pinning a joint to keep the call
+                            # site clean.
+                            if force_joint is not None and collect_batch is explorer.collect_batch_continuous:
+                                collect_kwargs["force_joint"] = force_joint
+                            dataset_dir = collect_batch(
+                                cfg,
+                                int(n_eps),
+                                **collect_kwargs,
                             )
                         finally:
                             try:
@@ -994,6 +1083,10 @@ def main_loop(
                     prev_ckpt = new_ckpt
                     prev_train_val_mse = train_val_mse
                     prev_locked_val_mse = locked_val_mse
+                    # Capture the per-cell MSE breakdown for the next
+                    # EXPLORE phase's per-joint sub-burst targeting.
+                    # None for older eval runs without per_cell_mse output.
+                    current_per_cell_mse = result.get("per_cell_mse")
                     registry.reset_guard_rejections()
                     try:
                         hardware.reload_checkpoint(prev_ckpt)

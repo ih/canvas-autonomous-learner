@@ -296,6 +296,25 @@ def _read_eval_visual_mse(eval_output_dir: Path) -> Optional[float]:
     return float(val) if val is not None else None
 
 
+def _read_per_cell_mse(eval_output_dir: Path) -> Optional[dict]:
+    """Read the per-(joint, position-bin) MSE breakdown from an eval run.
+
+    Returns the dict produced by `evaluate.py`'s `per_cell_mse` field, or
+    None if the report is missing or the field isn't present (older
+    canvases predate sub-phase 1's metadata; older eval runs predate
+    sub-phase 2's per-cell accumulator). Consumed by the per-joint
+    sub-burst planner.
+    """
+    report = eval_output_dir / "report.json"
+    if not report.exists():
+        return None
+    with open(report) as f:
+        data = json.load(f)
+    metrics = data.get("metrics", data)
+    cells = metrics.get("per_cell_mse")
+    return cells if isinstance(cells, dict) else None
+
+
 def _motor_bounds_arg(cfg) -> list[str]:
     """Return `[--motor-bounds-json, <json>]` if cfg.training.motor_bounds
     is set, else `[]`. Shared by both `build_canvases` and `combine_datasets`
@@ -592,6 +611,11 @@ def retrain_cumulative(
         train_val_mse = evaluate(
             cfg, new_ckpt, merged_dir, eval_out_train, event_log=event_log
         )
+        # Per-(joint, position-bin) MSE breakdown from the merged-train
+        # eval — the same one that produced train_val_mse. Consumed by
+        # the per-joint sub-burst planner when cadence.per_joint_targeting
+        # is enabled. None for older datasets/checkpoints.
+        per_cell_mse = _read_per_cell_mse(eval_out_train)
 
         locked_val_mse = None
         if locked_val_dataset is not None and Path(locked_val_dataset).exists():
@@ -671,6 +695,9 @@ def retrain_cumulative(
             locked_val_mse=locked_val_mse,
             locked_val_shoulder=locked_val_shoulder,
             locked_val_elbow=locked_val_elbow,
+            per_cell_mse_joints=(
+                sorted(per_cell_mse.keys()) if per_cell_mse else None
+            ),
             num_canvas_dirs=len(dirs),
             epochs=epochs,
             from_scratch=(resume_checkpoint is None),
@@ -682,6 +709,7 @@ def retrain_cumulative(
         "locked_val_mse": locked_val_mse,
         "locked_val_shoulder": locked_val_shoulder,
         "locked_val_elbow": locked_val_elbow,
+        "per_cell_mse": per_cell_mse,
     }
 
 

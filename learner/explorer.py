@@ -268,6 +268,173 @@ def plan_explore_sub_bursts(
     return surviving
 
 
+def plan_per_joint_sub_bursts(
+    per_cell_mse: dict | None,
+    joint_pool: list[str],
+    joint_ranges: dict[str, tuple[float, float]],
+    total_episodes: int,
+    max_sub_bursts: int = 3,
+    min_sub_burst_size: int = 10,
+    min_sub_burst_width: float = 0.0,
+    unvisited_bonus: float = 1.5,
+) -> list[tuple[int, str, tuple[float, float]]]:
+    """Plan per-(joint, position-bin) sub-bursts from a per-cell MSE map.
+
+    Companion to `plan_explore_sub_bursts` for the multi-joint case.
+    Reads the per-cell MSE histogram produced by `evaluate.py` (sub-phase 2)
+    and returns up to `max_sub_bursts` `(n_eps, joint, (lo, hi))` triples,
+    each pinning EXPLORE to a single joint inside one of its hot
+    position bins.
+
+    Args:
+        per_cell_mse: dict of `joint_name -> [{bin, lo, hi, mean_mse, count}]`
+            as written by evaluate.py. None or empty falls back to a
+            uniform per-joint allocation across `joint_pool`.
+        joint_pool: list of joint names eligible for targeting (e.g.
+            ["shoulder_pan", "elbow_flex"]). Joints outside this pool
+            are ignored even if they appear in per_cell_mse.
+        joint_ranges: per-joint full active range. Used as the fallback
+            range when a joint has no measured cells.
+        total_episodes: budget across all sub-bursts.
+        max_sub_bursts: cap on the number of `(joint, bin)` pairs returned.
+        min_sub_burst_size: floor per sub-burst. Capped by total_episodes
+            // min_sub_burst_size as in the 1D planner.
+        min_sub_burst_width: skip cells narrower than this (typically
+            2 × position_delta to ensure a valid step inside the bin).
+        unvisited_bonus: weight multiplier on `max(observed_mean_mse) *
+            bonus` for joints that appear in joint_pool but have no
+            measured cells. Encourages exploration of under-probed joints.
+
+    Returns:
+        list of `(n_eps, joint_name, (lo, hi))` tuples summing to at
+        most total_episodes (may sum to less after the floor filter).
+
+    Empty histogram fallback:
+        - All joints in pool look "unvisited" → uniform per-joint
+          allocation across max_sub_bursts (or fewer if budget too small).
+        - Each unvisited joint gets a sub-burst spanning its full range.
+    """
+    if total_episodes <= 0 or not joint_pool:
+        return []
+
+    if max_sub_bursts <= 0:
+        return []
+
+    if min_sub_burst_size > 0:
+        max_sub_bursts_by_budget = max(1, int(total_episodes) // int(min_sub_burst_size))
+        max_sub_bursts = min(max_sub_bursts, max_sub_bursts_by_budget)
+
+    # Build a flat list of candidate cells.
+    # Visited cells: from per_cell_mse, with their actual mean_mse.
+    # Unvisited joints: synthetic cell spanning full range, scored as
+    #   max_observed_mean * unvisited_bonus (or 1.0 if nothing observed).
+    candidates: list[dict] = []  # each: {joint, lo, hi, score}
+    pool_set = set(joint_pool)
+    cells_by_joint: dict[str, list[dict]] = {}
+    if per_cell_mse:
+        for joint, cells in per_cell_mse.items():
+            if joint not in pool_set:
+                continue
+            for c in cells:
+                lo = float(c.get("lo"))
+                hi = float(c.get("hi"))
+                if hi <= lo:
+                    continue
+                if min_sub_burst_width > 0 and (hi - lo) < min_sub_burst_width:
+                    continue
+                cell = {
+                    "joint": joint,
+                    "lo": lo,
+                    "hi": hi,
+                    "score": float(c.get("mean_mse", 0.0)),
+                }
+                candidates.append(cell)
+                cells_by_joint.setdefault(joint, []).append(cell)
+
+    max_observed = max((c["score"] for c in candidates), default=0.0)
+    unvisited_score = max(max_observed * unvisited_bonus, 1.0)
+
+    for joint in joint_pool:
+        if joint in cells_by_joint:
+            continue
+        full_range = joint_ranges.get(joint)
+        if full_range is None:
+            continue
+        lo, hi = float(full_range[0]), float(full_range[1])
+        if hi <= lo:
+            continue
+        if min_sub_burst_width > 0 and (hi - lo) < min_sub_burst_width:
+            continue
+        candidates.append({
+            "joint": joint, "lo": lo, "hi": hi, "score": unvisited_score,
+        })
+
+    if not candidates:
+        return []
+
+    # Top-K by score
+    candidates.sort(key=lambda c: -c["score"])
+    chosen = candidates[:max_sub_bursts]
+    total_weight = sum(c["score"] for c in chosen)
+    if total_weight <= 0:
+        # All zero scores — uniform allocation across chosen.
+        n_each = max(min_sub_burst_size, int(total_episodes // len(chosen)))
+        out = []
+        allocated = 0
+        for i, c in enumerate(chosen):
+            n = (int(total_episodes) - allocated) if i == len(chosen) - 1 else n_each
+            allocated += n
+            out.append((max(0, n), c["joint"], (c["lo"], c["hi"])))
+        # Filter floor + clip overshoot, mirroring the 1D planner's
+        # post-processing.
+        return _finalize_per_joint_allocations(out, total_episodes, min_sub_burst_size)
+
+    allocations: list[tuple[int, str, tuple[float, float]]] = []
+    allocated = 0
+    for idx, c in enumerate(chosen):
+        if idx == len(chosen) - 1:
+            n_eps = int(total_episodes) - allocated
+        else:
+            share = int(total_episodes * c["score"] / total_weight)
+            n_eps = max(min_sub_burst_size, share)
+        allocated += n_eps
+        allocations.append((n_eps, c["joint"], (c["lo"], c["hi"])))
+
+    return _finalize_per_joint_allocations(allocations, total_episodes, min_sub_burst_size)
+
+
+def _finalize_per_joint_allocations(
+    allocations: list[tuple[int, str, tuple[float, float]]],
+    total_episodes: int,
+    min_sub_burst_size: int,
+) -> list[tuple[int, str, tuple[float, float]]]:
+    """Apply overshoot trim + floor filter + redistribution.
+
+    Mirrors plan_explore_sub_bursts's post-processing exactly so per-joint
+    bursts behave the same way as 1D bursts under the same edge cases.
+    """
+    if not allocations:
+        return []
+
+    overshoot = sum(n for n, _, _ in allocations) - int(total_episodes)
+    if overshoot > 0:
+        biggest_idx = max(range(len(allocations)), key=lambda i: allocations[i][0])
+        n, j, r = allocations[biggest_idx]
+        allocations[biggest_idx] = (max(0, n - overshoot), j, r)
+
+    surviving = [(n, j, r) for n, j, r in allocations if n >= min_sub_burst_size]
+    dropped = sum(n for n, _, _ in allocations if n < min_sub_burst_size)
+    if not surviving:
+        # Floor filter killed everything — collapse to a single sub-burst
+        # on the highest-score candidate covering its full range.
+        n, j, r = allocations[0]
+        return [(int(total_episodes), j, r)]
+    if dropped > 0:
+        n, j, r = surviving[0]
+        surviving[0] = (n + dropped, j, r)
+    return surviving
+
+
 def _cache_path_for_repo_id(repo_id: str) -> Path:
     return Path.home() / ".cache" / "huggingface" / "lerobot" / repo_id
 
@@ -572,6 +739,7 @@ def collect_batch_continuous(
     probe_script: list[tuple[float, str]] | None = None,
     repo_id_prefix: str | None = None,
     event_tag: str = "explore_start",
+    force_joint: str | None = None,
 ) -> Path | None:
     """Continuous-stream EXPLORE — same contract as `collect_batch`.
 
@@ -632,11 +800,21 @@ def collect_batch_continuous(
     # Joints pool: prefer cfg.explore.joints if set, else fall back to
     # the single policy_joint_name. Keeps single-joint configs working
     # without forcing them to add a `joints:` list to the YAML.
-    joints_pool = getattr(cfg.explore, "joints", None)
-    if joints_pool:
-        joints = list(joints_pool)
+    # When `force_joint` is set (per-joint sub-burst targeting), pin
+    # the pool to that single joint and disable vary_target.
+    if force_joint is not None:
+        # Recorder expects motor names with `.pos` suffix for the joints
+        # pool. Accept both forms from the caller for convenience.
+        joint_with_pos = (
+            force_joint if force_joint.endswith(".pos") else f"{force_joint}.pos"
+        )
+        joints = [joint_with_pos]
     else:
-        joints = [cfg.explore.policy_joint_name]
+        joints_pool = getattr(cfg.explore, "joints", None)
+        if joints_pool:
+            joints = list(joints_pool)
+        else:
+            joints = [cfg.explore.policy_joint_name]
 
     # Merge baseline cfg.explore.joint_ranges with the per-burst override
     # the same way collect_batch does — overrides win.
@@ -684,8 +862,9 @@ def collect_batch_continuous(
         cmd.extend(["--joint-range", str(joint), str(float(lo)), str(float(hi))])
 
     # If the config pins joints[0] for vary_target=False (single-joint
-    # mode), pass --no-vary-target so the sequencer never wanders.
-    if not getattr(cfg.explore, "vary_target_joint", True):
+    # mode), or the caller pinned a force_joint, pass --no-vary-target
+    # so the sequencer never wanders.
+    if force_joint is not None or not getattr(cfg.explore, "vary_target_joint", True):
         cmd.append("--no-vary-target")
 
     # Match legacy: pass cfg.robot.home as starting positions so the
@@ -701,6 +880,7 @@ def collect_batch_continuous(
             repo_id=repo_id,
             episodes=int(num_episodes),
             joint_range_override=joint_range_override,
+            force_joint=force_joint,
             mode="continuous",
             pre_action_settle_duration=pre_settle,
         )

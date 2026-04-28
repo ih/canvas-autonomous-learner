@@ -76,6 +76,14 @@ cadence:
   # in streaming). Default false until Phase 3 A/B soak validates that
   # the streaming model converges within 5% of the legacy baseline.
   continuous_explore: false
+  # Per-(joint, position-bin) error-driven sub-burst targeting. When true,
+  # the orchestrator reads the per_cell_mse breakdown from evaluate.py
+  # (sub-phase 2 of the per-joint plan) and pins each sub-burst to the
+  # hottest (joint, range) cell. Only takes effect when the joint pool
+  # has more than one joint AND a per_cell_mse breakdown is available
+  # (i.e. after at least one RETRAIN with the new evaluate.py). Silently
+  # falls back to the 1D plan_explore_sub_bursts otherwise.
+  per_joint_targeting: false
   probes_per_verify: 6
   window_size: 24
   settle_time: 0.5
