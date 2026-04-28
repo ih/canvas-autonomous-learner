@@ -161,7 +161,17 @@ def main_loop(
     if hardware is None:
         hardware = Hardware(cfg, dry_run=getattr(cfg, "dry_run", False))
 
-    collect_batch = _collect_batch or explorer.collect_batch
+    # `cadence.continuous_explore: true` selects the streaming recorder
+    # for EXPLORE bursts (rfmt scripts/streaming/record_continuous.py).
+    # Verifier still uses the legacy episodic recorder via explorer.collect_batch
+    # because the streaming sequencer doesn't support probe_script. Test-only
+    # `_collect_batch` injection bypasses the dispatch entirely.
+    if _collect_batch is not None:
+        collect_batch = _collect_batch
+    elif bool(getattr(getattr(cfg, "cadence", None), "continuous_explore", False)):
+        collect_batch = explorer.collect_batch_continuous
+    else:
+        collect_batch = explorer.collect_batch
     build_canvases = _build_canvases or trainer_driver.build_canvases
     retrain_fn = _retrain or trainer_driver.retrain_cumulative
     run_advisor = _run_advisor or claude_advisor.run_advisor

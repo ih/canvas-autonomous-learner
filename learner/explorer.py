@@ -44,6 +44,21 @@ _EPISODE_ACTION_RE = re.compile(
 # start of each episode — a clean snapshot of the commanded joint state.
 _RESET_CMD_RE = re.compile(r"Reset(?:\s+retry\s+\d+)?:\s*commanding\s*(\{[^}]*\})")
 
+# Streaming recorder progress lines (record_continuous.py). Each action
+# produces one INFO log line like:
+#   "2026-04-28 12:34:56,789 INFO root action 1/5 joint=shoulder_pan dir=positive
+#    target=30.37 pre_settle=2 action=10 wall=2.45s"
+# We anchor on "action N/M joint=" to avoid matching the legacy recorder's
+# "action" word.
+_STREAM_ACTION_RE = re.compile(
+    r"action\s+(\d+)\s*/\s*(\d+)\s+joint=(\S+)\s+dir=(\S+)\s+target=([-\d.]+)"
+)
+# Verify checkpoint line, every `verify_every` actions:
+#   "verify@N: <joint> cmd=X actual=Y err=Z"
+_STREAM_VERIFY_RE = re.compile(
+    r"verify@(\d+):\s+(\S+)\s+cmd=([-\d.]+)\s+actual=([-\d.]+)\s+err=([-\d.]+)"
+)
+
 
 def pick_probe_action(window: RollingWindow, candidates: list[int]) -> int:
     """Uniform for a cold window; otherwise weight toward high-MSE actions.
@@ -512,6 +527,248 @@ def collect_batch(
         for raw_line in proc.stdout:
             # Universal newlines splits on \n, \r, and \r\n so we see
             # tqdm updates as they land.
+            line = raw_line.rstrip("\r\n")
+            if line:
+                _handle_line(line)
+    finally:
+        proc.wait()
+
+    if proc.returncode != 0:
+        if event_log is not None:
+            event_log.log("explore_failed", repo_id=repo_id, returncode=proc.returncode)
+        return None
+
+    if not dataset_path.exists():
+        if event_log is not None:
+            event_log.log("explore_missing_output", repo_id=repo_id, expected=str(dataset_path))
+        return None
+
+    if event_log is not None:
+        event_log.log("explore_done", repo_id=repo_id, path=str(dataset_path))
+    return dataset_path
+
+
+def collect_batch_continuous(
+    cfg,
+    num_episodes: int,
+    window: RollingWindow | None = None,
+    event_log=None,
+    joint_range_override: dict[str, tuple[float, float]] | None = None,
+    randomize_primary_start: bool | None = None,
+    probe_script: list[tuple[float, str]] | None = None,
+    repo_id_prefix: str | None = None,
+    event_tag: str = "explore_start",
+) -> Path | None:
+    """Continuous-stream EXPLORE — same contract as `collect_batch`.
+
+    Shells out to `scripts.streaming.record_continuous` in
+    `robotic-foundation-model-tests` instead of the legacy
+    `run_single_action_record.py`. Each "episode" is one action_duration
+    window with a 200ms pre-action camera-flush settle (matches the
+    Phase 1 default). All episodes share one chunked MP4 + parquet,
+    bit-compatible with `canvas-world-model/create_dataset.py`.
+
+    Drop-in replacement for `collect_batch`:
+      - same signature and return type (`Path | None` to the dataset root)
+      - emits the same `explore_start` / `explore_action_taken` /
+        `explore_done` / `explore_failed` events (plus a streaming-
+        specific `explore_action_progress` per action)
+      - hardware MUST be disconnected by the orchestrator before calling
+
+    Differences:
+      - `randomize_primary_start` is silently ignored — the streaming
+        sequencer produces an organic action stream where each new
+        target derives from the *current* motor pose, not a random
+        per-episode reset. Coverage of `joint_range_override` happens
+        naturally as the sequence walks the range.
+      - `probe_script` is unsupported and raises NotImplementedError.
+        The verifier path always uses legacy `collect_batch` for forced
+        per-episode start positions; only orchestrator EXPLORE bursts
+        switch to streaming.
+      - `window` is currently unused (the sequencer doesn't yet condition
+        on the rolling error window — future enhancement).
+    """
+    if probe_script is not None:
+        raise NotImplementedError(
+            "probe_script is not supported by the continuous-stream recorder. "
+            "Verifier flows must use collect_batch (legacy) for forced "
+            "per-episode start positions."
+        )
+    del randomize_primary_start  # acknowledged but ignored — see docstring
+    del window  # not yet used by the streaming sequencer
+
+    session = _session_stamp()
+    if repo_id_prefix is None:
+        repo_id_prefix = getattr(getattr(cfg, "explore", None), "repo_id_prefix", None) \
+            or "auto/autonomous-explore"
+    repo_id = f"{repo_id_prefix}-{session}"
+    dataset_path = _cache_path_for_repo_id(repo_id)
+    if dataset_path.exists():
+        shutil.rmtree(dataset_path)
+
+    rfmt_root = Path(cfg.paths.robotic_foundation_model_tests)
+    if not (rfmt_root / "scripts" / "streaming" / "record_continuous.py").exists():
+        raise FileNotFoundError(
+            f"streaming recorder not found under {rfmt_root}/scripts/streaming/. "
+            "Phase 1 (rfmt commit d41535a or later) must be installed."
+        )
+
+    python_exe = cfg.paths.python or sys.executable
+
+    # Joints pool: prefer cfg.explore.joints if set, else fall back to
+    # the single policy_joint_name. Keeps single-joint configs working
+    # without forcing them to add a `joints:` list to the YAML.
+    joints_pool = getattr(cfg.explore, "joints", None)
+    if joints_pool:
+        joints = list(joints_pool)
+    else:
+        joints = [cfg.explore.policy_joint_name]
+
+    # Merge baseline cfg.explore.joint_ranges with the per-burst override
+    # the same way collect_batch does — overrides win.
+    baseline_ranges = getattr(cfg.explore, "joint_ranges", None)
+    merged_ranges: dict[str, tuple[float, float]] = {}
+    if baseline_ranges:
+        if hasattr(baseline_ranges, "__dict__"):
+            src = vars(baseline_ranges)
+        else:
+            src = dict(baseline_ranges)
+        for k, v in src.items():
+            if v is None:
+                continue
+            lo, hi = v
+            merged_ranges[str(k)] = (float(lo), float(hi))
+    if joint_range_override:
+        for k, v in joint_range_override.items():
+            lo, hi = v
+            merged_ranges[str(k)] = (float(lo), float(hi))
+
+    pre_settle = float(getattr(cfg.explore, "pre_action_settle_duration", 0.2))
+
+    cmd = [
+        python_exe,
+        "-m", "scripts.streaming.record_continuous",
+        f"--robot-port={cfg.robot.port}",
+        f"--robot-id={cfg.robot.robot_id}",
+        f"--base-camera={cfg.robot.base_camera}",
+        f"--wrist-camera={cfg.robot.wrist_camera}",
+        f"--base-camera-name={cfg.explore.base_camera_name}",
+        f"--wrist-camera-name={cfg.explore.wrist_camera_name}",
+        f"--camera-width={cfg.robot.camera_width}",
+        f"--camera-height={cfg.robot.camera_height}",
+        f"--camera-fps={cfg.robot.camera_fps}",
+        f"--num-actions={int(num_episodes)}",
+        f"--action-duration={cfg.explore.action_duration}",
+        f"--pre-action-settle-duration={pre_settle}",
+        f"--fps={cfg.explore.dataset_fps}",
+        "--joints", *joints,
+        f"--position-delta={cfg.robot.step_size}",
+        f"--output-repo-id={repo_id}",
+    ]
+
+    for joint, (lo, hi) in merged_ranges.items():
+        cmd.extend(["--joint-range", str(joint), str(float(lo)), str(float(hi))])
+
+    # If the config pins joints[0] for vary_target=False (single-joint
+    # mode), pass --no-vary-target so the sequencer never wanders.
+    if not getattr(cfg.explore, "vary_target_joint", True):
+        cmd.append("--no-vary-target")
+
+    # Match legacy: pass cfg.robot.home as starting positions so the
+    # subprocess snaps the arm to a known pose before the first action.
+    home_ns = getattr(cfg.robot, "home", None)
+    if home_ns is not None:
+        home_dict = {k: float(v) for k, v in vars(home_ns).items()}
+        cmd.append(f"--starting-positions-json={json.dumps(home_dict)}")
+
+    if event_log is not None:
+        event_log.log(
+            event_tag,
+            repo_id=repo_id,
+            episodes=int(num_episodes),
+            joint_range_override=joint_range_override,
+            mode="continuous",
+            pre_action_settle_duration=pre_settle,
+        )
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(rfmt_root),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # merge so the regex sees logging.INFO lines
+            text=True,
+            bufsize=1,
+        )
+    except (OSError, FileNotFoundError) as e:
+        if event_log is not None:
+            event_log.log("explore_failed", repo_id=repo_id, error=str(e))
+        return None
+
+    # Streaming recorder doesn't prompt for input, but close stdin so it
+    # doesn't ever block on a stray read.
+    try:
+        if proc.stdin is not None:
+            proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+
+    last_emitted_action: Optional[int] = None
+
+    def _handle_line(line: str) -> None:
+        nonlocal last_emitted_action
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+        for m in _STREAM_ACTION_RE.finditer(line):
+            action_idx = int(m.group(1))
+            total = int(m.group(2))
+            joint = m.group(3)
+            direction = m.group(4)
+            target_pos = float(m.group(5))
+            if last_emitted_action is None or action_idx > last_emitted_action:
+                last_emitted_action = action_idx
+                if event_log is not None:
+                    # Same shape as legacy `explore_episode_progress` so
+                    # the dashboard's progress bar Just Works without
+                    # branching on mode.
+                    event_log.log(
+                        "explore_episode_progress",
+                        repo_id=repo_id,
+                        episode_index=action_idx - 1,  # 0-indexed
+                        total_episodes=total,
+                    )
+                    event_log.log(
+                        "explore_action_taken",
+                        repo_id=repo_id,
+                        joint=joint,
+                        direction=direction,
+                        magnitude=float(cfg.robot.step_size),
+                    )
+                    event_log.log(
+                        "explore_action_progress",
+                        repo_id=repo_id,
+                        action_index=action_idx,
+                        total_actions=total,
+                        joint=joint,
+                        direction=direction,
+                        target_pos=target_pos,
+                    )
+        for m in _STREAM_VERIFY_RE.finditer(line):
+            if event_log is not None:
+                event_log.log(
+                    "explore_verify_checkpoint",
+                    repo_id=repo_id,
+                    after_action=int(m.group(1)),
+                    joint=m.group(2),
+                    cmd=float(m.group(3)),
+                    actual=float(m.group(4)),
+                    err=float(m.group(5)),
+                )
+
+    try:
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
             line = raw_line.rstrip("\r\n")
             if line:
                 _handle_line(line)

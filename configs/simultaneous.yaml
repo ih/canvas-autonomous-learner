@@ -69,6 +69,13 @@ cadence:
   claude_advisor_crash_timeout_s: 1800
   claude_advisor_model: opus
   claude_advisor_effort: max
+  # Phase-2 streaming EXPLORE switch. When true, EXPLORE bursts use
+  # rfmt scripts/streaming/record_continuous.py instead of the legacy
+  # episodic recorder — 2-5x wall-time speedup at equivalent canvas
+  # yield. Verifier path always uses legacy (probe_script unsupported
+  # in streaming). Default false until Phase 3 A/B soak validates that
+  # the streaming model converges within 5% of the legacy baseline.
+  continuous_explore: false
   probes_per_verify: 6
   window_size: 24
   settle_time: 0.5
