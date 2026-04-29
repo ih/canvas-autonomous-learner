@@ -1,0 +1,140 @@
+# Streaming + per-joint targeting smoke run.
+# Derived from simultaneous.yaml with:
+#   - both new features ENABLED (continuous_explore + per_joint_targeting)
+#   - claude advisor DISABLED (deterministic state machine, no surprise overrides)
+#   - tighter tau thresholds (force EXPLORE on first VERIFY)
+#   - fresh runs_dir/registry so we don't fight the production checkpoint's
+#     depth=14 vs config depth=12 mismatch (the smoke cold-starts cleanly)
+#   - reduced epochs (50 cold-start, 30 fine-tune) so the run completes in
+#     reasonable wall time on hardware
+#
+# Restore production runs by switching --config back to simultaneous.yaml.
+
+paths:
+  canvas_world_model: ../canvas-world-model
+  canvas_robot_control: ../canvas-robot-control
+  robotic_foundation_model_tests: ../robotic-foundation-model-tests
+  base_canvas: null
+  val_dataset: null
+  locked_val_shoulder: ./datasets/locked_val/shoulder
+  locked_val_elbow: ./datasets/locked_val/elbow
+  locked_val_dataset: ./datasets/locked_val/shoulder
+  live_checkpoint: null               # cold-start
+  ckpt_dir: ./runs/sim_smoke/checkpoints
+  canvas_out: ./runs/sim_smoke/canvas
+  lerobot_out: ./runs/sim_smoke/lerobot
+  runs_dir: ./runs/sim_smoke
+  registry_file: ./runs/sim_smoke/registry.json
+  python: C:/Projects/pythonenv-lerobot/Scripts/python.exe
+
+robot:
+  port: COM3
+  robot_id: my_so101_follower
+  control_joint: shoulder_pan
+  step_size: 10.0
+  joint_min: -60.0
+  joint_max: 60.0
+  base_camera: 1
+  wrist_camera: 0
+  camera_width: 640
+  camera_height: 480
+  camera_fps: 10
+  home:
+    shoulder_pan: 21.07
+    shoulder_lift: -100.00
+    elbow_flex: 94.92
+    wrist_flex: 31.82
+    wrist_roll: 5.12
+    gripper: 10.13
+
+thresholds:
+  tau_low: 0.005
+  tau_high: 0.008
+  val_guard: 1.25
+  max_consecutive_rejections: 3
+
+cadence:
+  idle_seconds: 0
+  claude_advisor_enabled: false
+  claude_max_consecutive_retrains: 5
+  claude_advisor_crash_timeout_s: 1800
+  claude_advisor_model: opus
+  claude_advisor_effort: max
+  continuous_explore: true
+  per_joint_targeting: true
+  probes_per_verify: 6
+  window_size: 24
+  settle_time: 0.5
+  base_explore_batch_size: 20
+  explore_batch_size_min: 20
+  explore_batch_size_max: 60
+  max_sub_bursts: 3
+  min_sub_burst_size: 20
+  cold_start_epochs: 50
+  ft_epochs: 30
+  early_stop_patience: 8
+  safety_cap_episodes: 3000
+  warmup_cycles: 2
+  explore_max_retries: 2
+  explore_retry_backoff: 10.0
+  training_stall_timeout_s: 600
+  retrain_timeout_s: 3600
+
+gpu:
+  memory_abort_frac: 0.93
+  memory_warn_frac: 0.85
+  sample_interval_s: 5.0
+
+range:
+  enabled: false
+
+training:
+  patch_size: 16
+  embed_dim: 512
+  depth: 12
+  num_heads: 16
+  num_train_timesteps: 1000
+  beta_schedule: cosine
+  prediction_type: sample
+  lr: 3.0e-4
+  weight_decay: 0.01
+  lr_schedule: cosine
+  warmup_epochs: 8
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+  batch_size: 4
+  seed: 42
+  val_ratio: 0.1
+  motor_bounds:
+    motor_norm_min: [-100.0, -100.0, -100.0, -100.0, -100.0, -100.0]
+    motor_norm_max: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
+
+actions:
+  candidates: [1, 2, 3]
+  probe_weights: null
+
+explore:
+  vary_target_joint: true
+  joints:
+    - shoulder_pan.pos
+    - elbow_flex.pos
+  joint_ranges:
+    shoulder_pan.pos: [-60.0, 60.0]
+    elbow_flex.pos: [50.0, 90.0]
+  policy_joint_name: shoulder_pan.pos
+  action_duration: 1.0
+  start_buffer: 2.5
+  dataset_fps: 10
+  base_camera_name: base_0_rgb
+  wrist_camera_name: left_wrist_0_rgb
+  repo_id_prefix: sim_smoke/autonomous-explore
+  inactive_joint_positions:
+    shoulder_lift: -100.00
+    wrist_flex: 31.82
+    wrist_roll: 5.12
+    gripper: 10.13
+
+verify:
+  repo_id_prefix: sim_smoke/autonomous-verify
+
+dry_run: false

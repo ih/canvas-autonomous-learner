@@ -391,8 +391,18 @@ _TRAINING_FLAG_MAP: list[tuple[str, str]] = [
     ("min_lr", "--min-lr"),
     ("grad_clip", "--grad-clip"),
     ("batch_size", "--batch-size"),
+    ("gradient_accumulation_steps", "--gradient-accumulation-steps"),
     ("seed", "--seed"),
     ("val_ratio", "--val-ratio"),
+]
+
+# Boolean training flags forwarded as bare --flag (no value) when truthy.
+# Used for the bf16 / grad-checkpointing / 8-bit-Adam mechanics that scale
+# trainable model size on a single 32GB card.
+_TRAINING_BOOL_FLAGS: list[tuple[str, str]] = [
+    ("bf16", "--bf16"),
+    ("gradient_checkpointing", "--gradient-checkpointing"),
+    ("use_8bit_adam", "--use-8bit-adam"),
 ]
 
 
@@ -412,6 +422,9 @@ def _forward_training_hparams(cfg, cmd: list[str]) -> None:
         if value is None:
             continue
         cmd.extend([flag, str(value)])
+    for attr, flag in _TRAINING_BOOL_FLAGS:
+        if bool(getattr(training, attr, False)):
+            cmd.append(flag)
 
 
 def train(

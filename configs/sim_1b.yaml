@@ -1,0 +1,160 @@
+# 1B-parameter scale-up of the simultaneous arm.
+# Architecture: depth=28 / embed_dim=1408 / num_heads=22 → ~1.02B params.
+# Training mechanics required to fit on a 32GB 5090:
+#   - bf16 mixed precision (forward/backward in bf16, master weights fp32)
+#   - gradient checkpointing on every transformer block
+#   - bitsandbytes AdamW8bit optimizer state
+#   - batch_size=1 with gradient_accumulation_steps=4 (effective batch=4)
+#
+# Cold-start only — no prior 1B checkpoint exists. ft_epochs reduced for
+# tractable autonomous-learner cycles; cold_start_epochs reduced because
+# the cold-start canvas dataset is small and we just want pipeline
+# validation, not convergence to publication quality.
+#
+# Streaming + per-joint targeting both ON. Advisor disabled to skip
+# Claude THINK overhead on each cycle (the advisor's training overrides
+# would also clobber the 1B-specific hparams).
+#
+# Restore production: switch --config back to simultaneous.yaml.
+
+paths:
+  canvas_world_model: ../canvas-world-model
+  canvas_robot_control: ../canvas-robot-control
+  robotic_foundation_model_tests: ../robotic-foundation-model-tests
+  base_canvas: null
+  val_dataset: null
+  locked_val_shoulder: ./datasets/locked_val/shoulder
+  locked_val_elbow: ./datasets/locked_val/elbow
+  locked_val_dataset: ./datasets/locked_val/shoulder
+  live_checkpoint: null
+  ckpt_dir: ./runs/sim_1b/checkpoints
+  canvas_out: ./runs/sim_1b/canvas
+  lerobot_out: ./runs/sim_1b/lerobot
+  runs_dir: ./runs/sim_1b
+  registry_file: ./runs/sim_1b/registry.json
+  python: C:/Projects/pythonenv-lerobot/Scripts/python.exe
+
+robot:
+  port: COM3
+  robot_id: my_so101_follower
+  control_joint: shoulder_pan
+  step_size: 10.0
+  joint_min: -60.0
+  joint_max: 60.0
+  base_camera: 1
+  wrist_camera: 0
+  camera_width: 640
+  camera_height: 480
+  camera_fps: 10
+  home:
+    shoulder_pan: 21.07
+    shoulder_lift: -100.00
+    elbow_flex: 94.92
+    wrist_flex: 31.82
+    wrist_roll: 5.12
+    gripper: 10.13
+
+thresholds:
+  tau_low: 0.005
+  tau_high: 0.008
+  val_guard: 1.5      # looser than 1.25 because 1B cold-start is noisy early
+  max_consecutive_rejections: 3
+
+cadence:
+  idle_seconds: 0
+  claude_advisor_enabled: false
+  claude_max_consecutive_retrains: 5
+  claude_advisor_crash_timeout_s: 1800
+  claude_advisor_model: opus
+  claude_advisor_effort: max
+  continuous_explore: true
+  per_joint_targeting: true
+  probes_per_verify: 6
+  window_size: 24
+  settle_time: 0.5
+  base_explore_batch_size: 20
+  explore_batch_size_min: 20
+  explore_batch_size_max: 60
+  max_sub_bursts: 3
+  min_sub_burst_size: 20
+  cold_start_epochs: 30
+  ft_epochs: 20
+  early_stop_patience: 6
+  safety_cap_episodes: 3000
+  warmup_cycles: 2
+  explore_max_retries: 2
+  explore_retry_backoff: 10.0
+  training_stall_timeout_s: 1800
+  retrain_timeout_s: 14400      # 4h ceiling for any single retrain at 1B
+
+gpu:
+  memory_abort_frac: 0.95   # bumped from 0.93 — 1B sits closer to the limit
+  memory_warn_frac: 0.88
+  sample_interval_s: 5.0
+
+range:
+  enabled: false
+
+training:
+  # Architecture — 28 layers x 1408 wide ≈ 1.02B params at patch=16
+  patch_size: 16
+  embed_dim: 1408
+  depth: 28
+  num_heads: 22
+
+  # Training mechanics — all required at 1B on 32GB
+  bf16: true
+  gradient_checkpointing: true
+  use_8bit_adam: true
+  batch_size: 1
+  gradient_accumulation_steps: 4   # effective batch = 4
+
+  # Diffusion (unchanged from production)
+  num_train_timesteps: 1000
+  beta_schedule: cosine
+  prediction_type: sample
+
+  # Optimization
+  lr: 3.0e-4
+  weight_decay: 0.01
+  lr_schedule: cosine
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+  seed: 42
+  val_ratio: 0.1
+
+  # Lock motor-strip normalization at SO-101 hardware limits
+  motor_bounds:
+    motor_norm_min: [-100.0, -100.0, -100.0, -100.0, -100.0, -100.0]
+    motor_norm_max: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
+
+actions:
+  candidates: [1, 2, 3]
+  probe_weights: null
+
+explore:
+  vary_target_joint: true
+  joints:
+    - shoulder_pan.pos
+    - elbow_flex.pos
+  joint_ranges:
+    shoulder_pan.pos: [-60.0, 60.0]
+    elbow_flex.pos: [50.0, 90.0]
+  policy_joint_name: shoulder_pan.pos
+  action_duration: 1.0
+  start_buffer: 2.5
+  dataset_fps: 10
+  base_camera_name: base_0_rgb
+  wrist_camera_name: left_wrist_0_rgb
+  repo_id_prefix: sim_1b/autonomous-explore
+  inactive_joint_positions:
+    shoulder_lift: -100.00
+    wrist_flex: 31.82
+    wrist_roll: 5.12
+    gripper: 10.13
+
+verify:
+  repo_id_prefix: sim_1b/autonomous-verify
+
+dry_run: false
