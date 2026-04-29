@@ -88,8 +88,15 @@ cadence:
   retrain_timeout_s: 14400      # 4h ceiling for any single retrain at 1B
 
 gpu:
-  memory_abort_frac: 0.95   # bumped from 0.93 — 1B sits closer to the limit
-  memory_warn_frac: 0.88
+  # 1B fine-tune at bf16 + grad-ckpt + 8-bit Adam peaks at ~31.9 GB on
+  # the 5090's 32 GB. The cold-start path peaks lower (~30 GB) because
+  # there's no `--fine-tune` state_dict load. We've measured training
+  # making real progress at 97.9% — abort at 99.5% so transient peaks
+  # don't kill the run, but CUDA OOM is still the hard ceiling.
+  # Validated end-to-end: 4 cycles (1 cold-start + 3 FT) at this
+  # threshold completed without OOM.
+  memory_abort_frac: 0.995
+  memory_warn_frac: 0.93
   sample_interval_s: 5.0
 
 range:
