@@ -62,7 +62,11 @@ thresholds:
 
 cadence:
   idle_seconds: 0
-  claude_advisor_enabled: false
+  # Advisor re-enabled now that apply_cfg_overrides blocks architectural
+  # fields (depth/embed_dim/num_heads/patch_size/batch_size/bf16/...).
+  # The advisor can still tune lr / weight_decay / ft_epochs / sub-burst
+  # cadence, but cannot mismatch the loaded checkpoint's architecture.
+  claude_advisor_enabled: true
   claude_max_consecutive_retrains: 5
   claude_advisor_crash_timeout_s: 1800
   claude_advisor_model: opus

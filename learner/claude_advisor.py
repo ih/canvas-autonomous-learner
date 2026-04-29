@@ -885,13 +885,32 @@ _KNOWN_CADENCE_FIELDS = {
 }
 
 
+# Architecture-binding fields that the advisor MUST NOT change once a
+# checkpoint exists. Changing any of these would mismatch the loaded
+# state_dict on the next --fine-tune and crash the train subprocess
+# (we caught this twice during the depth=14→16 mismatch and again
+# during the 1B scale-up). The advisor's prompt encourages bumping
+# capacity when val plateaus, but capacity bumps require a cold-start
+# rebuild — out of scope for runtime overrides.
+_ARCH_FROZEN_TRAINING_FIELDS = frozenset({
+    "patch_size", "embed_dim", "depth", "num_heads",
+    "num_train_timesteps",
+    # Mixed-precision + memory-fit knobs — also pinned because changing
+    # them mid-run could OOM or change loss scale unexpectedly.
+    "bf16", "gradient_checkpointing", "use_8bit_adam",
+    "gradient_accumulation_steps", "batch_size",
+})
+
+
 def apply_cfg_overrides(
     cfg, overrides: dict, event_log=None,
 ) -> dict:
     """Apply dotted-path overrides to cfg.training.* and cfg.cadence.*.
 
-    Unknown keys are logged + skipped. Numeric values ≤ 0 on positive-
-    only fields are clamped. Returns the actually-applied dict.
+    Unknown keys are logged + skipped. Architecture-binding training
+    fields are silently rejected with a `claude_override_blocked` event
+    (see `_ARCH_FROZEN_TRAINING_FIELDS`). Numeric values ≤ 0 on
+    positive-only fields are clamped. Returns the actually-applied dict.
     """
     if not overrides:
         return {}
@@ -916,6 +935,19 @@ def apply_cfg_overrides(
             if event_log is not None:
                 event_log.log(
                     "claude_override_unknown", target=section, key=field,
+                )
+            continue
+        # Architectural fields are frozen once a checkpoint exists.
+        # The advisor's prompt invites architecture changes ("bump depth
+        # from 12 to 16") but those would mismatch the loaded checkpoint
+        # at the next --fine-tune. Block them at the apply boundary.
+        if section == "training" and field in _ARCH_FROZEN_TRAINING_FIELDS:
+            if event_log is not None:
+                event_log.log(
+                    "claude_override_blocked",
+                    target=section, key=field,
+                    requested=raw_value,
+                    reason="architecture_frozen",
                 )
             continue
         ns = getattr(cfg, section, None)

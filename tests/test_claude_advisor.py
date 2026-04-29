@@ -106,6 +106,65 @@ def test_apply_cfg_overrides_clamps_nonpositive():
     assert cfg.training.lr > 0
 
 
+def test_apply_cfg_overrides_blocks_architecture_fields():
+    """Architecture-binding fields are frozen once a checkpoint exists.
+    The advisor must NOT be able to override depth/embed_dim/num_heads/
+    patch_size — doing so would mismatch the loaded state_dict at the
+    next --fine-tune and crash the train subprocess (history: depth=14→16
+    mismatch in the smoke run, and a likely crash for the 1B run if the
+    advisor proposed depth=16 against the depth=28 ckpt).
+    """
+    cfg = _training_cfg()
+    cfg.training.depth = 28
+    cfg.training.embed_dim = 1408
+    cfg.training.num_heads = 22
+    cfg.training.patch_size = 16
+    cfg.training.batch_size = 1
+    cfg.training.bf16 = True
+    cfg.training.gradient_checkpointing = True
+    cfg.training.use_8bit_adam = True
+    cfg.training.gradient_accumulation_steps = 4
+
+    applied = claude_advisor.apply_cfg_overrides(
+        cfg,
+        {
+            # All blocked architecture-binding fields:
+            "training.depth": 16,
+            "training.embed_dim": 512,
+            "training.num_heads": 16,
+            "training.patch_size": 8,
+            "training.batch_size": 4,
+            "training.bf16": False,
+            "training.gradient_checkpointing": False,
+            "training.use_8bit_adam": False,
+            "training.gradient_accumulation_steps": 1,
+            # These should still be allowed:
+            "training.lr": 1e-4,
+            "training.weight_decay": 0.05,
+            "cadence.ft_epochs": 60,
+        },
+    )
+    # Architecture fields untouched on cfg
+    assert cfg.training.depth == 28
+    assert cfg.training.embed_dim == 1408
+    assert cfg.training.num_heads == 22
+    assert cfg.training.patch_size == 16
+    assert cfg.training.batch_size == 1
+    assert cfg.training.bf16 is True
+    assert cfg.training.gradient_checkpointing is True
+    assert cfg.training.use_8bit_adam is True
+    assert cfg.training.gradient_accumulation_steps == 4
+    # Non-architecture changes did apply
+    assert "training.lr" in applied
+    assert "training.weight_decay" in applied
+    assert "cadence.ft_epochs" in applied
+    # Architecture changes are NOT in the applied dict (silently dropped)
+    assert "training.depth" not in applied
+    assert "training.embed_dim" not in applied
+    assert "training.batch_size" not in applied
+    assert "training.bf16" not in applied
+
+
 # ---------------------------------------------------- apply_curriculum_overrides
 
 
