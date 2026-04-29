@@ -140,7 +140,7 @@ def verify_batch(
             getattr(getattr(cfg, "verify", None), "repo_id_prefix", None)
             or "auto/autonomous-verify"
         )
-        dataset_dir = explorer.collect_batch(
+        dataset_dir = explorer.collect_batch_continuous(
             cfg,
             num_probes,
             window=window,

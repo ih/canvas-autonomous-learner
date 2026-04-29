@@ -1,6 +1,6 @@
 """Phase 0.1: explorer subprocess smoke test.
 
-Runs `learner.explorer.collect_batch(cfg, num_episodes=2)` against real
+Runs `learner.explorer.collect_batch_continuous(cfg, num_episodes=2)` against real
 hardware and asserts the LeRobot cache dir exists afterward. Catches
 CLI/subprocess bugs in the run_single_action_record shell-out before a
 multi-hour Arm B run depends on it.
@@ -53,7 +53,7 @@ def main():
         joint_override = {joint_key: args.joint_range}
         print(f"[smoke] joint_range_override={joint_override}")
 
-    result = explorer.collect_batch(
+    result = explorer.collect_batch_continuous(
         cfg,
         args.episodes,
         event_log=log,

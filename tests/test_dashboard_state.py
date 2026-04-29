@@ -375,20 +375,34 @@ def test_live_episode_counter_resets_per_cycle(tmp_path):
     assert payload["episodes_this_cycle"] == 3
 
 
-def test_explore_episode_regex_matches_recorder_log():
-    """Regression: the regex should match `Recording episode N` lines
-    emitted by run_single_action_record.py's logger at episode start.
+def test_streaming_action_regex_matches_recorder_log():
+    """Regression: the regex should match `action N/M joint=X dir=Y target=Z`
+    lines emitted by record_continuous.py's logger per action. Replaces
+    the old _EPISODE_DONE_RE test that matched the now-retired legacy
+    `Recording episode N` line.
     """
-    from learner.explorer import _EPISODE_DONE_RE
+    from learner.explorer import _STREAM_ACTION_RE
     samples = [
-        ("INFO 2026-04-14 07:46:32 ls\\utils.py:227 Recording episode 0", [0]),
-        ("INFO 2026-04-14 07:48:23 ls\\utils.py:227 Recording episode 47", [47]),
-        ("Recording episode 12", [12]),
-        # tqdm lines no longer match
-        ("Episode 0: 100%|##########| 1/1 [00:00<00:00]", []),
+        # Standard streaming action line
+        (
+            "2026-04-29 08:12:34 INFO root action 1/60 joint=shoulder_pan dir=positive "
+            "target=10.50 pre_settle=2 action=10 wall=2.30s",
+            [(1, 60, "shoulder_pan", "positive")],
+        ),
+        # Different joint + direction
+        (
+            "action 47/60 joint=elbow_flex dir=negative target=70.00 "
+            "pre_settle=2 action=10 wall=2.10s",
+            [(47, 60, "elbow_flex", "negative")],
+        ),
         # Unrelated line → no match
         ("INFO 2026-04-13 ls\\utils.py: Start recording", []),
+        # Legacy `Recording episode N` should NOT match the new regex
+        ("INFO 2026-04-14 ls\\utils.py:227 Recording episode 0", []),
     ]
     for line, expected in samples:
-        matches = [int(m.group(1)) for m in _EPISODE_DONE_RE.finditer(line)]
+        matches = [
+            (int(m.group(1)), int(m.group(2)), m.group(3), m.group(4))
+            for m in _STREAM_ACTION_RE.finditer(line)
+        ]
         assert matches == expected, f"{line!r}: got {matches}, want {expected}"

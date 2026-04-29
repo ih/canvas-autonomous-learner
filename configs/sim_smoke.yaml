@@ -60,7 +60,6 @@ cadence:
   claude_advisor_crash_timeout_s: 1800
   claude_advisor_model: opus
   claude_advisor_effort: max
-  continuous_explore: true
   per_joint_targeting: true
   probes_per_verify: 6
   window_size: 24

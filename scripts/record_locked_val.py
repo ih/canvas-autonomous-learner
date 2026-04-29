@@ -61,7 +61,7 @@ def _record_one_joint(cfg, *, joint_name, joint_min, joint_max,
     joint_range_override = {joint_name: (float(joint_min), float(joint_max))}
     print(f"\n[{tag}] Recording {num_episodes} episodes on {joint_name} "
           f"(starts uniform in [{joint_min}, {joint_max}])")
-    dataset_path = explorer.collect_batch(
+    dataset_path = explorer.collect_batch_continuous(
         sub_cfg,
         num_episodes=num_episodes,
         joint_range_override=joint_range_override,
