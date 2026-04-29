@@ -142,6 +142,59 @@ def test_min_sub_burst_width_skips_narrow_cells():
             assert hi - lo >= 20.0
 
 
+def test_cell_ranges_clamped_to_safe_joint_ranges():
+    """Cells from evaluate.py are binned over motor_norm_min/max
+    ([-100, 100]) which is wider than the configured safe range. The
+    planner must intersect each cell with joint_ranges so the recorder
+    never sees a sub-burst range outside the safe zone (e.g. driving
+    elbow_flex below 50 in a configured [50, 90] range).
+    """
+    # Hot cell at bin boundary [40, 60], safe range [50, 90].
+    # After clamping: [50, 60], width=10 (passes min_sub_burst_width=10).
+    per_cell = {
+        "elbow_flex": [_cell(7, 40.0, 60.0, mean_mse=0.50)],
+    }
+    out = plan_per_joint_sub_bursts(
+        per_cell_mse=per_cell,
+        joint_pool=["elbow_flex"],
+        joint_ranges={"elbow_flex": (50.0, 90.0)},
+        total_episodes=20,
+        max_sub_bursts=1,
+        min_sub_burst_size=10,
+        min_sub_burst_width=10.0,
+    )
+    assert len(out) == 1
+    n_eps, joint, (lo, hi) = out[0]
+    assert joint == "elbow_flex"
+    assert lo >= 50.0, f"sub-burst lo={lo} dipped below safe min 50"
+    assert hi <= 90.0
+    assert n_eps == 20
+
+
+def test_cell_entirely_outside_safe_range_is_dropped():
+    """A cell that falls entirely outside the safe range (zero
+    intersection) should be dropped, not surface as an empty range."""
+    per_cell = {
+        "elbow_flex": [
+            _cell(0, -100.0, -80.0, mean_mse=0.99),  # fully below safe range
+            _cell(7, 40.0, 60.0, mean_mse=0.20),      # partial overlap, kept
+        ],
+    }
+    out = plan_per_joint_sub_bursts(
+        per_cell_mse=per_cell,
+        joint_pool=["elbow_flex"],
+        joint_ranges={"elbow_flex": (50.0, 90.0)},
+        total_episodes=20,
+        max_sub_bursts=2,
+        min_sub_burst_size=10,
+        min_sub_burst_width=5.0,
+    )
+    # Only the partial-overlap cell should produce a sub-burst.
+    for _, _, (lo, hi) in out:
+        assert lo >= 50.0
+        assert hi <= 90.0
+
+
 def test_sum_never_exceeds_total():
     """Across many random budgets, sum(n) <= total_episodes always."""
     import random

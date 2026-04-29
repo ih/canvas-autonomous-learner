@@ -328,6 +328,15 @@ def plan_per_joint_sub_bursts(
     # Visited cells: from per_cell_mse, with their actual mean_mse.
     # Unvisited joints: synthetic cell spanning full range, scored as
     #   max_observed_mean * unvisited_bonus (or 1.0 if nothing observed).
+    #
+    # Cell ranges are intersected with joint_ranges (the configured safe
+    # explore range per joint) so the recorder never gets commanded to
+    # drive a motor outside its mechanical safe zone. evaluate.py's
+    # per-cell bins are computed over motor_norm_min/max ([-100, 100]
+    # by default) which is far wider than the safe range for joints
+    # like elbow_flex (configured [50, 90]); without clamping, a hot
+    # cell at bin boundary [40, 60] would let the sequencer drive the
+    # elbow to 40, below the safe minimum.
     candidates: list[dict] = []  # each: {joint, lo, hi, score}
     pool_set = set(joint_pool)
     cells_by_joint: dict[str, list[dict]] = {}
@@ -335,11 +344,21 @@ def plan_per_joint_sub_bursts(
         for joint, cells in per_cell_mse.items():
             if joint not in pool_set:
                 continue
+            safe_range = joint_ranges.get(joint)
             for c in cells:
                 lo = float(c.get("lo"))
                 hi = float(c.get("hi"))
                 if hi <= lo:
                     continue
+                # Intersect with the configured safe range. If the cell
+                # falls entirely outside the safe range or has zero
+                # remaining width after clamping, drop it.
+                if safe_range is not None:
+                    safe_lo, safe_hi = float(safe_range[0]), float(safe_range[1])
+                    lo = max(lo, safe_lo)
+                    hi = min(hi, safe_hi)
+                    if hi <= lo:
+                        continue
                 if min_sub_burst_width > 0 and (hi - lo) < min_sub_burst_width:
                     continue
                 cell = {
