@@ -314,10 +314,13 @@ def main_loop(
     last_verify_mean_err: Optional[float] = None
     iteration = 0
     new_lerobot_dirs: list[Path] = []
+    new_lerobot_episode_counts: list[int] = []
     # Canvas dirs for the most recent EXPLORE, built upfront so the
     # advisor can inspect them at THINK time. RETRAIN reuses these and
-    # skips rebuilding.
+    # skips rebuilding. Parallel `_episode_counts` carries the per-dir
+    # episode count for the registry's `episodes_collected` accumulator.
     post_explore_canvas_dirs: list[Path] = []
+    post_explore_canvas_episode_counts: list[int] = []
     pending_novelty_report: Optional[dict] = None
 
     # THINK-phase mutable state
@@ -535,6 +538,7 @@ def main_loop(
 
                 if canonical == "retrain":
                     new_lerobot_dirs = []
+                    new_lerobot_episode_counts = []
                     consecutive_retrains_without_data += 1
                     state = State.RETRAIN
                 elif canonical == "idle":
@@ -785,6 +789,7 @@ def main_loop(
                     )
 
                 new_lerobot_dirs = []
+                new_lerobot_episode_counts = []
 
                 # Park the locked inactive joints to Arm A's centers so
                 # recorded data matches Arm A's distribution for the joints
@@ -884,6 +889,14 @@ def main_loop(
                             time.sleep(knobs.explore_retry_backoff)
                     if dataset_dir is not None:
                         new_lerobot_dirs.append(Path(dataset_dir))
+                        # Track episode count per lerobot dir so the
+                        # registry can persist a cumulative episode total
+                        # across launches (otherwise total_eps resets to
+                        # 0 every process restart and the dashboard's
+                        # locked-val trajectory bunches up at the same x
+                        # positions). Parallel list — index aligns with
+                        # new_lerobot_dirs.
+                        new_lerobot_episode_counts.append(int(n_eps))
                         total_eps += int(n_eps)
 
                 if not new_lerobot_dirs:
@@ -896,10 +909,11 @@ def main_loop(
                 # The RETRAIN branch will reuse these (skip rebuild).
                 canvas_out = Path(cfg.paths.canvas_out)
                 try:
-                    for d in new_lerobot_dirs:
+                    for d, n_eps_for_d in zip(new_lerobot_dirs, new_lerobot_episode_counts):
                         out_dir = canvas_out / f"batch_{_stamp()}_c{cycle}_{d.name}"
                         build_canvases(cfg, d, out_dir, event_log=event_log)
                         post_explore_canvas_dirs.append(out_dir)
+                        post_explore_canvas_episode_counts.append(n_eps_for_d)
                 except Exception as e:
                     event_log.log("build_canvases_failed", error=str(e), cycle=cycle)
                     termination["reason"] = "build_canvases_failed"
@@ -925,10 +939,16 @@ def main_loop(
                     pending_novelty_report = None
 
                 # Now register the new canvas dirs so subsequent
-                # retrains see them.
-                for d in post_explore_canvas_dirs:
+                # retrains see them. Pass per-dir episode counts so
+                # registry.episodes_collected accumulates across launches
+                # (otherwise total_eps resets to 0 on every restart and
+                # the dashboard's locked-val trajectory clusters at the
+                # same x positions for every cycle).
+                for d, n_eps_for_d in zip(
+                    post_explore_canvas_dirs, post_explore_canvas_episode_counts,
+                ):
                     accumulated_dirs.append(str(d))
-                    registry.append_canvas_dir(d, episodes_added=0)
+                    registry.append_canvas_dir(d, episodes_added=n_eps_for_d)
                 registry.save_range_state(
                     curriculum.to_registry_snapshot() if curriculum else {}
                 )
@@ -952,22 +972,27 @@ def main_loop(
                     # Clear so we don't re-use them on subsequent
                     # retrains.
                     post_explore_canvas_dirs = []
+                    post_explore_canvas_episode_counts = []
                 else:
                     new_canvas_dirs: list[Path] = []
+                    new_canvas_episode_counts: list[int] = []
                     canvas_out = Path(cfg.paths.canvas_out)
                     try:
-                        for d in new_lerobot_dirs:
+                        for d, n_eps_for_d in zip(
+                            new_lerobot_dirs, new_lerobot_episode_counts,
+                        ):
                             out_dir = canvas_out / f"batch_{_stamp()}_c{cycle}_{d.name}"
                             build_canvases(cfg, d, out_dir, event_log=event_log)
                             new_canvas_dirs.append(out_dir)
+                            new_canvas_episode_counts.append(n_eps_for_d)
                     except Exception as e:
                         event_log.log("build_canvases_failed", error=str(e), cycle=cycle)
                         termination["reason"] = "build_canvases_failed"
                         break
 
-                    for d in new_canvas_dirs:
+                    for d, n_eps_for_d in zip(new_canvas_dirs, new_canvas_episode_counts):
                         accumulated_dirs.append(str(d))
-                        registry.append_canvas_dir(d, episodes_added=0)
+                        registry.append_canvas_dir(d, episodes_added=n_eps_for_d)
                     registry.save_range_state(
                         curriculum.to_registry_snapshot() if curriculum else {}
                     )
@@ -1040,6 +1065,7 @@ def main_loop(
                         locked_val_mse=None, train_val_mse=None, accepted=False,
                     )
                     new_lerobot_dirs = []
+                    new_lerobot_episode_counts = []
                     pending_default_next_state = State.VERIFY
                     state = (
                         State.THINK if claude_advisor_enabled else State.VERIFY
@@ -1149,6 +1175,7 @@ def main_loop(
 
                 cycle += 1
                 new_lerobot_dirs = []
+                new_lerobot_episode_counts = []
                 # After every retrain, hand the result to Claude so the
                 # THINK phase can decide whether to retrain again (with
                 # different hparams), verify, explore, or terminate.
