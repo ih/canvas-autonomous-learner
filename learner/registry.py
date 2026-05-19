@@ -30,6 +30,14 @@ class Registry:
                 # Cold start + plateau stop
                 "episodes_collected": 0,
                 "accumulated_canvas_dirs": [],
+                # Parallel accumulator for wide-verify probe canvases.
+                # MUST stay strictly disjoint from `accumulated_canvas_dirs`
+                # (which feeds training) so the wide-verify corpus
+                # remains held-out for generalization eval. Each entry:
+                # {"path": str, "n_probes": int, "scenes": int,
+                #  "cycle": int, "t": iso8601-string}.
+                "wide_verify_canvas_dirs": [],
+                "wide_verify_history": [],
                 "locked_val_history": [],
                 "experiment_status": "unstarted",
                 "consecutive_guard_rejections": 0,
@@ -42,6 +50,18 @@ class Registry:
                 # advisor-issued verb awaiting orchestrator action.
                 "session_name": None,
                 "pending_advisor_decision": None,
+                # Scene-config tracking for the min-data experiment.
+                # `scene_idx` is the index of the scene CURRENTLY in
+                # front of the robot — increments by 1 on every IDLE-
+                # path `scene_ready_acknowledged`. `eps_per_scene` is a
+                # rollup mapping `str(scene_idx) -> cumulative episodes
+                # collected on that scene` (str keys because JSON
+                # mandates string-keyed dicts). Together these let the
+                # dashboard plot `wide_verify_mse vs num_scenes` and
+                # `vs eps_per_scene` directly. `scene_idx == 0` is the
+                # operator's initial setup at experiment_start.
+                "scene_idx": 0,
+                "eps_per_scene": {},
             })
 
     # --------------------------------------------------------------- internals
@@ -112,13 +132,119 @@ class Registry:
     def consecutive_guard_rejections(self) -> int:
         return int(self._read().get("consecutive_guard_rejections", 0))
 
-    def append_canvas_dir(self, path: str | Path, episodes_added: int) -> None:
+    def append_canvas_dir(
+        self,
+        path: str | Path,
+        episodes_added: int,
+        scene_idx: int | None = None,
+    ) -> None:
+        """Add a training canvas dir + bump cumulative episode count.
+
+        `scene_idx`: the scene the episodes were collected on. When
+        provided, increments `eps_per_scene[str(scene_idx)]` by
+        `episodes_added`. Defaults to the registry's current
+        `scene_idx` for backward compatibility — pass an explicit value
+        when historical episodes are added (e.g. from a prior session).
+        """
         data = self._read()
+        path_str = str(path)
+        # Leakage invariant: training data must never overlap the
+        # wide-verify (held-out) corpus. Symmetric check to
+        # append_wide_verify_dir.
+        wv_dirs = data.get("wide_verify_canvas_dirs", []) or []
+        if path_str in wv_dirs:
+            raise ValueError(
+                f"refusing to add training canvas dir {path_str!r}: it "
+                "is already in wide_verify_canvas_dirs (held-out set). "
+                "Training corpus MUST stay disjoint from wide-verify."
+            )
         dirs = list(data.get("accumulated_canvas_dirs", []))
-        dirs.append(str(path))
+        dirs.append(path_str)
         data["accumulated_canvas_dirs"] = dirs
         data["episodes_collected"] = int(data.get("episodes_collected", 0)) + int(episodes_added)
+        idx = int(scene_idx) if scene_idx is not None else int(data.get("scene_idx", 0))
+        eps_per_scene = dict(data.get("eps_per_scene", {}) or {})
+        key = str(idx)
+        eps_per_scene[key] = int(eps_per_scene.get(key, 0)) + int(episodes_added)
+        data["eps_per_scene"] = eps_per_scene
         self._write(data)
+
+    def scene_idx(self) -> int:
+        return int(self._read().get("scene_idx", 0))
+
+    def eps_per_scene(self) -> dict[str, int]:
+        return dict(self._read().get("eps_per_scene", {}) or {})
+
+    def bump_scene_idx(self) -> int:
+        """Increment scene_idx by 1, persist, return the new value.
+
+        Called by the orchestrator on every IDLE-path
+        `scene_ready_acknowledged` so subsequent canvas-dir appends are
+        tagged with the new scene's index. Wide-verify scene changes
+        do NOT bump this counter — wide-verify scenes are held-out and
+        live in their own corpus.
+        """
+        data = self._read()
+        new_idx = int(data.get("scene_idx", 0)) + 1
+        data["scene_idx"] = new_idx
+        self._write(data)
+        return new_idx
+
+    # ---------------------------------------- wide-verify (held-out corpus)
+
+    def wide_verify_canvas_dirs(self) -> list[str]:
+        """Paths to every canvas dir from prior wide-verify bursts.
+
+        These canvases are NEVER fed to training — they are the
+        held-out generalization corpus the trainer evaluates against
+        each retrain. The hard rule: a path that ever appears here
+        must never appear in `accumulated_canvas_dirs`.
+        """
+        return list(self._read().get("wide_verify_canvas_dirs", []))
+
+    def append_wide_verify_dir(
+        self,
+        path: str | Path,
+        *,
+        n_probes: int,
+        scenes: int,
+        cycle: int,
+    ) -> None:
+        """Record a new wide-verify canvas dir + its provenance.
+
+        Raises ValueError if the path already appears in
+        `accumulated_canvas_dirs` — the leakage invariant. Caller
+        should never construct a wide-verify path that overlaps the
+        training accumulator, but checking here makes the invariant
+        impossible to violate accidentally.
+        """
+        data = self._read()
+        path_str = str(path)
+        train_dirs = data.get("accumulated_canvas_dirs", []) or []
+        if path_str in train_dirs:
+            raise ValueError(
+                f"refusing to add wide-verify dir {path_str!r}: it is "
+                "already in accumulated_canvas_dirs (training set). "
+                "Wide-verify corpus MUST stay disjoint from training."
+            )
+        dirs = list(data.get("wide_verify_canvas_dirs", []))
+        dirs.append(path_str)
+        data["wide_verify_canvas_dirs"] = dirs
+        history = list(data.get("wide_verify_history", []))
+        history.append({
+            "path": path_str,
+            "n_probes": int(n_probes),
+            "scenes": int(scenes),
+            "cycle": int(cycle),
+            "t": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+        data["wide_verify_history"] = history
+        self._write(data)
+
+    def wide_verify_history(self) -> list[dict]:
+        """Provenance entries (path, n_probes, scenes, cycle, t) per
+        wide-verify burst. Newest last."""
+        return list(self._read().get("wide_verify_history", []))
 
     def append_locked_val(
         self,

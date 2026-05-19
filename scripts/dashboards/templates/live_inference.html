@@ -31,6 +31,7 @@
   .before-ts { font-size: 11px; color: var(--muted); margin-top: 6px; font-family: ui-monospace, Menlo, Consolas, monospace; }
   .canvas-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
   .empty { color: var(--muted); font-style: italic; font-size: 12px; padding: 20px; text-align: center; }
+  kbd { display: inline-block; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 10px; padding: 1px 5px; margin-left: 4px; background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; color: inherit; opacity: 0.85; vertical-align: middle; }
 </style></head><body>
 
 <header>
@@ -47,10 +48,7 @@
     <h2>Controls</h2>
 
     <label for="model-select">Model</label>
-    <select id="model-select">
-      <option value="learner">learner (live from registry)</option>
-      <option value="baseline">baseline (pre-learner)</option>
-    </select>
+    <select id="model-select"></select>
     <div class="note" id="model-note"></div>
 
     <label for="joint-select">Joint</label>
@@ -59,23 +57,23 @@
 
     <label>Action</label>
     <div class="radio-group">
-      <label><input type="radio" name="action" value="1" checked> move+</label>
-      <label><input type="radio" name="action" value="2"> move-</label>
-      <label><input type="radio" name="action" value="3"> hold</label>
+      <label><input type="radio" name="action" value="1" checked> move+ <kbd>1</kbd></label>
+      <label><input type="radio" name="action" value="2"> move- <kbd>2</kbd></label>
+      <label><input type="radio" name="action" value="3"> hold <kbd>3</kbd></label>
     </div>
 
     <div class="row">
-      <button class="primary" id="btn-predict">Predict</button>
-      <button class="primary" id="btn-execute">Execute on robot</button>
-      <button class="muted" id="btn-clear">Clear before</button>
+      <button class="primary" id="btn-predict" title="Predict (P)">Predict <kbd>P</kbd></button>
+      <button class="primary" id="btn-execute" title="Execute on robot (E)">Execute on robot <kbd>E</kbd></button>
+      <button class="muted" id="btn-clear" title="Clear before (C)">Clear before <kbd>C</kbd></button>
     </div>
     <div class="before-ts" id="before-ts">before: (none captured)</div>
     <div class="status" id="status"></div>
 
     <label style="margin-top: 18px;">Joint torque</label>
     <div class="row">
-      <button class="warn" id="btn-relax">Relax joints</button>
-      <button class="primary" id="btn-lock">Lock joints</button>
+      <button class="warn" id="btn-relax" title="Relax joints (R)">Relax joints <kbd>R</kbd></button>
+      <button class="primary" id="btn-lock" title="Lock joints (L)">Lock joints <kbd>L</kbd></button>
     </div>
   </div>
 
@@ -95,10 +93,9 @@
 const JOINTS = __JOINTS__;
 const CONTROL_JOINT = "__CONTROL_JOINT__";
 const MODE = "__MODE__";
-const LEARNER_CKPT = "__LEARNER_CKPT__";
-const BASELINE_CKPT = "__BASELINE_CKPT__";
-const HAS_BASELINE = __HAS_BASELINE__;
-const INITIAL_MODEL = "__INITIAL_MODEL__";
+const MODEL_OPTIONS = __MODEL_OPTIONS__;
+const INITIAL_MODEL_KEY = "__INITIAL_MODEL_KEY__";
+const INITIAL_MODEL_CKPT = "__INITIAL_MODEL_CKPT__";
 
 document.getElementById("mode-pill").textContent = "mode: " + MODE;
 document.getElementById("joint-pill").textContent = "joint: " + CONTROL_JOINT;
@@ -108,46 +105,67 @@ function shortCkpt(p) {
   const parts = p.replace(/\\/g, "/").split("/");
   return parts.slice(-2).join("/");
 }
-function updateModelPills(label, ckpt) {
-  document.getElementById("model-pill").textContent = "model: " + label;
-  document.getElementById("ckpt-pill").textContent = "ckpt: " + shortCkpt(ckpt);
-  document.getElementById("model-pill").className = "pill " + (label === "learner" ? "ok" : "");
+function modelPillClass(key) {
+  // Highlight live + autonomous-learner-best as "current/promoted" (green).
+  if (key === "live" || key === "best_learner" || key === "best_1b") return "pill ok";
+  return "pill";
 }
-updateModelPills(INITIAL_MODEL, INITIAL_MODEL === "baseline" ? BASELINE_CKPT : LEARNER_CKPT);
+function updateModelPills(key, ckpt) {
+  document.getElementById("model-pill").textContent = "model: " + key;
+  document.getElementById("ckpt-pill").textContent = "ckpt: " + shortCkpt(ckpt);
+  document.getElementById("model-pill").className = modelPillClass(key);
+}
+updateModelPills(INITIAL_MODEL_KEY, INITIAL_MODEL_CKPT);
 
 const modelSelect = document.getElementById("model-select");
-modelSelect.value = INITIAL_MODEL;
-if (!HAS_BASELINE) {
-  // Disable the baseline option if no baseline path was configured.
-  for (const opt of modelSelect.options) {
-    if (opt.value === "baseline") { opt.disabled = true; opt.textContent += " (not configured — pass --baseline-checkpoint)"; }
+let lastModelKey = INITIAL_MODEL_KEY;
+
+function populateModelSelect() {
+  modelSelect.innerHTML = "";
+  if (!MODEL_OPTIONS || MODEL_OPTIONS.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "(no models discovered)";
+    opt.disabled = true;
+    modelSelect.appendChild(opt);
+    return;
+  }
+  for (const m of MODEL_OPTIONS) {
+    const opt = document.createElement("option");
+    opt.value = m.key;
+    opt.textContent = m.label;
+    opt.dataset.note = m.note || "";
+    if (m.key === INITIAL_MODEL_KEY) opt.selected = true;
+    modelSelect.appendChild(opt);
   }
 }
+populateModelSelect();
+
 function updateModelNote() {
   const note = document.getElementById("model-note");
-  const v = modelSelect.value;
-  if (v === "learner") {
-    note.textContent = "Live checkpoint from the autonomous-learner registry: " + LEARNER_CKPT;
-    note.style.borderLeftColor = "#3a4254";
-  } else {
-    note.textContent = "Pre-learner baseline: " + BASELINE_CKPT;
-    note.style.borderLeftColor = "#3a4254";
-  }
+  const opt = modelSelect.selectedOptions[0];
+  note.textContent = (opt && opt.dataset.note) || "";
+  note.style.borderLeftColor = "#3a4254";
 }
 updateModelNote();
+
 modelSelect.addEventListener("change", async () => {
   updateModelNote();
   const chosen = modelSelect.value;
+  if (!chosen) return;
   setStatus("loading " + chosen + " model (this may take 10-30s)...", "");
+  modelSelect.disabled = true;
   try {
     const res = await postJSON("/api/set_model", {model: chosen});
     updateModelPills(res.active_model, res.active_checkpoint);
-    setStatus("loaded model: " + res.active_model, "ok");
+    setStatus("loaded model: " + (res.active_label || res.active_model), "ok");
+    lastModelKey = res.active_model;
   } catch (e) {
     setStatus("model switch failed: " + e.message, "err");
-    // roll the dropdown back so UI matches server state
-    modelSelect.value = INITIAL_MODEL;
+    modelSelect.value = lastModelKey;
     updateModelNote();
+  } finally {
+    modelSelect.disabled = false;
   }
 });
 
@@ -288,6 +306,33 @@ document.getElementById("btn-lock").addEventListener("click", async () => {
   } catch (e) {
     setStatus("lock failed: " + e.message, "err");
   }
+});
+
+// Keyboard shortcuts. Skip when typing in form fields or with modifier keys
+// (so browser shortcuts like Ctrl+L still work).
+const KEY_TO_BUTTON = {
+  p: "btn-predict",
+  e: "btn-execute",
+  c: "btn-clear",
+  r: "btn-relax",
+  l: "btn-lock",
+};
+document.addEventListener("keydown", (ev) => {
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  const tag = (ev.target && ev.target.tagName) || "";
+  if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || ev.target.isContentEditable) return;
+  const key = ev.key.toLowerCase();
+  if (key === "1" || key === "2" || key === "3") {
+    const radio = document.querySelector('input[name=action][value="' + key + '"]');
+    if (radio) { radio.checked = true; ev.preventDefault(); }
+    return;
+  }
+  const btnId = KEY_TO_BUTTON[key];
+  if (!btnId) return;
+  const btn = document.getElementById(btnId);
+  if (!btn || btn.disabled) return;
+  ev.preventDefault();
+  btn.click();
 });
 </script>
 </body></html>

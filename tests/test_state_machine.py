@@ -201,12 +201,14 @@ def _stub_trio(tmp_path: Path, probe_iter, retrain_results=None, retrain_hook=No
         return Path(output_dir)
 
     def fake_retrain(cfg_, accumulated_canvas_dirs, resume_checkpoint, epochs,
-                      locked_val_dataset=None, event_log=None):
+                      locked_val_dataset=None, wide_verify_canvas_dirs=None,
+                      event_log=None):
         retrain_calls.append({
             "accumulated_canvas_dirs": list(accumulated_canvas_dirs),
             "resume_checkpoint": resume_checkpoint,
             "epochs": epochs,
             "locked_val_dataset": locked_val_dataset,
+            "wide_verify_canvas_dirs": list(wide_verify_canvas_dirs or []),
         })
         if retrain_hook is not None:
             return retrain_hook(len(retrain_calls) - 1, tmp_path)
@@ -475,7 +477,11 @@ def test_safety_cap_fires(tmp_path, monkeypatch):
 def test_val_guard_uses_locked_val_mse(tmp_path, monkeypatch):
     # Cycle 0 accepted (cycle < warmup). Cycle 1: train_val ticks UP but
     # locked_val ticks DOWN — the guard must accept on locked_val.
+    # locked_val is the legacy-mode comparator; pin legacy here since the
+    # repo-wide default is now lifelong (which would prefer
+    # train_val / wide_verify and fail this test's legacy intent).
     cfg = _make_cfg(tmp_path, warmup_cycles=1, stable_cycles_required=999)
+    cfg.cadence.lifelong_mode = False
     probes = [
         _probe(1, 0.05, 0.0), _probe(2, 0.05, 0.0), _probe(3, 0.05, 0.0),
         _probe(1, 0.05, 0.0), _probe(2, 0.05, 0.0), _probe(3, 0.05, 0.0),
@@ -500,6 +506,95 @@ def test_val_guard_uses_locked_val_mse(tmp_path, monkeypatch):
     assert len(history) >= 2
     # Cycle 1's retrain should be ACCEPTED because locked_val improved
     assert history[1]["accepted"] is True
+
+
+def test_val_guard_lifelong_prefers_wide_verify_when_available(tmp_path, monkeypatch):
+    # When the trainer reports wide_verify_mse, the lifelong val_guard
+    # MUST use it as the comparator instead of train_val. Sequence:
+    # cycle 0 baseline (warmup), cycle 1 has wide_verify_mse=0.20 (above
+    # 1.25 * prev=0.10 = 0.125) so guard rejects on wide_verify, even
+    # though train_val improved.
+    cfg = _make_cfg(tmp_path, warmup_cycles=1, stable_cycles_required=999)
+    cfg.cadence.lifelong_mode = True
+    probes = [
+        _probe(1, 0.05, 0.0), _probe(2, 0.05, 0.0), _probe(3, 0.05, 0.0),
+        _probe(1, 0.05, 0.0), _probe(2, 0.05, 0.0), _probe(3, 0.05, 0.0),
+    ]
+    retrain_calls: list[dict] = []
+    def fake_retrain(cfg_, accumulated_canvas_dirs, resume_checkpoint, epochs,
+                      locked_val_dataset=None, wide_verify_canvas_dirs=None,
+                      event_log=None):
+        idx = len(retrain_calls)
+        retrain_calls.append({"wide_verify_canvas_dirs": list(wide_verify_canvas_dirs or [])})
+        ckpt = tmp_path / f"ft_{idx}.pth"
+        ckpt.write_text("x")
+        # cycle 0: baseline. wide_verify_mse=0.10 (sets prev). train_val=0.02.
+        # cycle 1: train_val improved (0.01) but wide_verify regressed (0.20).
+        # Lifelong guard must REJECT on wide_verify.
+        if idx == 0:
+            return {
+                "checkpoint": str(ckpt),
+                "merged_dataset": str(tmp_path / f"merged_{idx}"),
+                "train_val_mse": 0.02,
+                "locked_val_mse": None,
+                "wide_verify_mse": 0.10,
+            }
+        return {
+            "checkpoint": str(ckpt),
+            "merged_dataset": str(tmp_path / f"merged_{idx}"),
+            "train_val_mse": 0.01,
+            "locked_val_mse": None,
+            "wide_verify_mse": 0.20,
+        }
+
+    fv, fc, fb, _fr_unused, calls = _stub_trio(tmp_path, probes, retrain_results=[])
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
+
+    registry = Registry(cfg.paths.registry_file)
+    orchestrator.main_loop(
+        cfg, hardware=FakeHardware(), registry=registry,
+        event_log=EventLog(cfg.paths.runs_dir, session="wv_guard"),
+        max_iterations=10,
+        _collect_batch=fc, _build_canvases=fb, _retrain=fake_retrain,
+    )
+    history = registry.locked_val_history()
+    assert len(history) >= 2
+    # Cycle 1 must be REJECTED because wide_verify_mse regressed.
+    assert history[1]["accepted"] is False
+
+
+def test_val_guard_lifelong_uses_train_val_only(tmp_path, monkeypatch):
+    # Same setup as the legacy test but with cadence.lifelong_mode=true.
+    # Cycle 1's locked_val IMPROVES (0.08 < 0.10) but its train_val
+    # REGRESSES badly (0.05 > 0.02 * 1.25 = 0.025). In legacy mode the
+    # locked_val improvement saves the swap; in lifelong mode locked_val
+    # is auxiliary observability only, so the train_val regression must
+    # cause rejection.
+    cfg = _make_cfg(tmp_path, warmup_cycles=1, stable_cycles_required=999)
+    cfg.cadence.lifelong_mode = True
+    probes = [
+        _probe(1, 0.05, 0.0), _probe(2, 0.05, 0.0), _probe(3, 0.05, 0.0),
+        _probe(1, 0.05, 0.0), _probe(2, 0.05, 0.0), _probe(3, 0.05, 0.0),
+    ]
+    retrain_results = [
+        _default_retrain_result(0, tmp_path, locked_val=0.10, train_val=0.02),
+        _default_retrain_result(1, tmp_path, locked_val=0.08, train_val=0.05),
+    ]
+    fv, fc, fb, fr, calls = _stub_trio(tmp_path, probes, retrain_results)
+    monkeypatch.setattr(orchestrator.verifier, "verify_batch", fv)
+
+    registry = Registry(cfg.paths.registry_file)
+    orchestrator.main_loop(
+        cfg, hardware=FakeHardware(), registry=registry,
+        event_log=EventLog(cfg.paths.runs_dir, session="lifelong_guard"),
+        max_iterations=10,
+        _collect_batch=fc, _build_canvases=fb, _retrain=fr,
+    )
+    history = registry.locked_val_history()
+    assert len(history) >= 2
+    # Cycle 1 must be REJECTED — locked_val improvement no longer rescues
+    # a train_val regression in lifelong mode.
+    assert history[1]["accepted"] is False
 
 
 # --------------------------------- invariant 9: accumulated dirs grow
@@ -811,7 +906,8 @@ def test_memory_abort_routes_to_think_and_does_not_terminate(tmp_path, monkeypat
     retrain_calls: list = []
 
     def fake_retrain(cfg_, accumulated_canvas_dirs, resume_checkpoint, epochs,
-                      locked_val_dataset=None, event_log=None):
+                      locked_val_dataset=None, wide_verify_canvas_dirs=None,
+                      event_log=None):
         retrain_calls.append(1)
         if len(retrain_calls) == 1:
             return {
@@ -866,7 +962,8 @@ def test_stalled_result_routes_to_think(tmp_path, monkeypatch):
     probes = [_probe(1, 0.5, 0.0) for _ in range(30)]
 
     def fake_retrain(cfg_, accumulated_canvas_dirs, resume_checkpoint, epochs,
-                      locked_val_dataset=None, event_log=None):
+                      locked_val_dataset=None, wide_verify_canvas_dirs=None,
+                      event_log=None):
         return {
             "stalled": True,
             "tag": "train_diffusion",

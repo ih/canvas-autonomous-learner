@@ -107,6 +107,7 @@ INDEX_HTML = r"""<!doctype html>
 
 <header>
   <h1>canvas-autonomous-learner</h1>
+  <span class="pill" id="experiment-pill" style="background:#2d3a52;color:#cfe1ff;font-weight:600;">—</span>
   <span class="session" id="session">—</span>
   <span class="pill" id="state-pill">init</span>
   <span class="pill" id="connected-pill">connecting…</span>
@@ -125,10 +126,21 @@ INDEX_HTML = r"""<!doctype html>
 <div class="strip" style="padding-top:6px;padding-bottom:10px;">
   <div class="card"><b id="m-time-idle">—</b><span>idle time</span></div>
   <div class="card"><b id="m-time-verify">—</b><span>verify time</span></div>
+  <div class="card"><b id="m-time-operator-wait">—</b><span>operator wait (wide-verify)</span></div>
   <div class="card"><b id="m-time-explore">—</b><span>explore time</span></div>
   <div class="card"><b id="m-time-retrain">—</b><span>retrain time</span></div>
   <div class="card"><b id="m-time-think">—</b><span>think time</span></div>
   <div class="card"><b id="m-time-total">—</b><span>total wall time</span></div>
+  <div class="card"><b id="m-scene-changes">0</b><span>scene changes</span></div>
+  <div class="card"><b id="m-scene-idx">0</b><span>current scene</span></div>
+  <div class="card"><b id="m-scenes-seen">1</b><span>scenes seen</span></div>
+  <div class="card"><b id="m-eps-current-scene">0</b><span>eps in current scene</span></div>
+</div>
+<div class="strip" style="padding-top:6px;padding-bottom:10px;">
+  <div class="card" style="grid-column: 1 / -1;">
+    <span style="font-size:11px;color:var(--muted);">wide_verify_mse vs scenes seen (each accepted retrain)</span>
+    <div id="wv-vs-scenes-chart" style="margin-top:4px;"></div>
+  </div>
 </div>
 
 <!-- Scene-change banner: high-contrast card shown only while the learner
@@ -812,10 +824,20 @@ function renderThinkingLatest(entry) {
         ${_renderOverridesBlock("curriculum_overrides", advice.curriculum_overrides)}
         ${_renderOverridesBlock("explore_overrides", advice.explore_overrides)}
         ${advice.scene_change_description ? `<div style="margin-top:8px;padding:8px 10px;background:#3a2a12;border-left:3px solid #f7a072;font-size:12px;color:#fff;">${escapeHtml(advice.scene_change_description)}</div>` : ""}
+        ${advice.prompt_improvement_suggestion ? `<div style="margin-top:8px;padding:8px 10px;background:#1a2d3a;border-left:3px solid #6ea8fe;font-size:12px;color:#dce6ff;"><div style="font-size:10px;color:#6ea8fe;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;">prompt-improvement suggestion</div>${escapeHtml(advice.prompt_improvement_suggestion)}</div>` : ""}
         ${advice.from_scratch ? `<div style="margin-top:8px;font-size:11px;color:#ff6b6b;">⚠ from_scratch=true — next retrain cold-starts</div>` : ""}
       </div>
     </div>
   `;
+}
+
+// Set of expanded THINK-history entry keys (stringified entry.t). Lives
+// across re-renders so expand/collapse state survives the dashboard's
+// poll-driven innerHTML refresh.
+const _expandedThinkRows = new Set();
+
+function _thinkRowKey(entry) {
+  return String(entry.t != null ? entry.t : `${entry.cycle}-noop`);
 }
 
 function renderThinkingHistory(history) {
@@ -828,13 +850,61 @@ function renderThinkingHistory(history) {
     const ts = entry.t ? new Date(entry.t * 1000).toLocaleTimeString() : "";
     const next = advice.next_state || "?";
     const reason = advice.reason || "";
-    return `<div style="display:flex;gap:10px;align-items:center;padding:6px 0;border-bottom:1px dashed #232735;">
-      <span style="flex:0 0 auto;">${_nextStateBadge(next)}</span>
-      <span style="flex:1 1 auto;font-size:12px;color:#c8cddc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(reason)}</span>
-      <span style="flex:0 0 auto;font-size:10px;color:var(--muted);">c${entry.cycle} · ${ts}</span>
+    const key = _thinkRowKey(entry);
+    const isOpen = _expandedThinkRows.has(key);
+    const overrides = [
+      _renderOverridesBlock("runtime_overrides", advice.runtime_overrides),
+      _renderOverridesBlock("training_overrides", advice.training_overrides),
+      _renderOverridesBlock("curriculum_overrides", advice.curriculum_overrides),
+      _renderOverridesBlock("explore_overrides", advice.explore_overrides),
+    ].join("");
+    const sceneChange = advice.scene_change_description
+      ? `<div style="margin-top:8px;padding:8px 10px;background:#3a2a12;border-left:3px solid #f7a072;font-size:12px;color:#fff;">${escapeHtml(advice.scene_change_description)}</div>`
+      : "";
+    const promptSuggestion = advice.prompt_improvement_suggestion
+      ? `<div style="margin-top:8px;padding:8px 10px;background:#1a2d3a;border-left:3px solid #6ea8fe;font-size:12px;color:#dce6ff;"><div style="font-size:10px;color:#6ea8fe;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px;">prompt-improvement suggestion</div>${escapeHtml(advice.prompt_improvement_suggestion)}</div>`
+      : "";
+    const fromScratch = advice.from_scratch
+      ? `<div style="margin-top:8px;font-size:11px;color:#ff6b6b;">⚠ from_scratch=true — next retrain cold-starts</div>`
+      : "";
+    const chevron = isOpen ? "▾" : "▸";
+    const collapsedVis = isOpen ? "hidden" : "visible";
+    const detailsDisp = isOpen ? "block" : "none";
+    return `<div style="border-bottom:1px dashed #232735;padding:6px 0;">
+      <div onclick="toggleThinkHistoryRow('${escapeHtml(key)}', this)" style="display:flex;gap:10px;align-items:center;cursor:pointer;user-select:none;">
+        <span style="flex:0 0 auto;color:var(--muted);font-size:10px;width:10px;display:inline-block;" data-chevron>${chevron}</span>
+        <span style="flex:0 0 auto;">${_nextStateBadge(next)}</span>
+        <span class="think-history-reason-collapsed" style="flex:1 1 auto;font-size:12px;color:#c8cddc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;visibility:${collapsedVis};">${escapeHtml(reason)}</span>
+        <span style="flex:0 0 auto;font-size:10px;color:var(--muted);">c${entry.cycle} · ${ts}</span>
+      </div>
+      <div data-think-details style="display:${detailsDisp};margin:8px 0 4px 26px;">
+        <div style="color:var(--ink);font-size:13px;line-height:1.5;white-space:pre-wrap;">${escapeHtml(reason)}</div>
+        ${overrides}
+        ${sceneChange}
+        ${promptSuggestion}
+        ${fromScratch}
+      </div>
     </div>`;
   }).join("");
   return rows;
+}
+
+function toggleThinkHistoryRow(key, headerEl) {
+  if (_expandedThinkRows.has(key)) {
+    _expandedThinkRows.delete(key);
+  } else {
+    _expandedThinkRows.add(key);
+  }
+  const isOpen = _expandedThinkRows.has(key);
+  const rowEl = headerEl.parentElement;
+  const details = rowEl ? rowEl.querySelector("[data-think-details]") : null;
+  if (details) details.style.display = isOpen ? "block" : "none";
+  const collapsedReason = headerEl.querySelector(".think-history-reason-collapsed");
+  if (collapsedReason) {
+    collapsedReason.style.visibility = isOpen ? "hidden" : "visible";
+  }
+  const chevron = headerEl.querySelector("[data-chevron]");
+  if (chevron) chevron.textContent = isOpen ? "▾" : "▸";
 }
 
 function escapeHtml(s) {
@@ -1001,6 +1071,7 @@ function renderTrainingChart(progress, epochsTarget, width, height) {
 function parseCanvasName(name) {
   // Verify probes look like   action_canvas_c000_p5_100018.png
   // Explore replays look like action_canvas_c000_ep0003_d01_100018.png
+  // Train previews look like  action_canvas_train_e0010_s2_100018.png
   const mEx = name.match(/action_canvas_c(\d+)_ep(\d+)_d(\d+)_/);
   if (mEx) {
     return `cycle ${+mEx[1]} · episode ${+mEx[2]} · action ${+mEx[3]}  [EXPLORE]`;
@@ -1008,6 +1079,10 @@ function parseCanvasName(name) {
   const mPr = name.match(/action_canvas_c(\d+)_p(\d+)_/);
   if (mPr) {
     return `cycle ${+mPr[1]} · probe ${+mPr[2]}  [VERIFY]`;
+  }
+  const mTr = name.match(/action_canvas_train_e(\d+)_s(\d+)_/);
+  if (mTr) {
+    return `epoch ${+mTr[1]} · sample ${+mTr[2]}  [TRAIN]`;
   }
   // Legacy probe_*.png fallback
   return name;
@@ -1048,6 +1123,17 @@ async function poll() {
     const connPill = document.getElementById("connected-pill");
     connPill.textContent = "live";
     connPill.className = "pill ok";
+
+    // Experiment name (runs_dir basename) — present even when there's
+    // no session yet, since the dashboard knows which directory it's
+    // pointed at before any events land.
+    const expPill = document.getElementById("experiment-pill");
+    if (s.experiment) {
+      expPill.textContent = s.experiment;
+      // Reflect the experiment name in the tab title too so multiple
+      // dashboard tabs are distinguishable.
+      document.title = `${s.experiment} — canvas-autonomous-learner`;
+    }
 
     if (!s.session) {
       document.getElementById("session").textContent = "(no session yet — waiting for runs/events_*.jsonl)";
@@ -1092,11 +1178,30 @@ async function poll() {
     const sd = s.stage_durations || {};
     document.getElementById("m-time-idle").textContent = fmtDur(sd.IDLE);
     document.getElementById("m-time-verify").textContent = fmtDur(sd.VERIFY);
+    document.getElementById("m-time-operator-wait").textContent = fmtDur(sd.OPERATOR_WAIT);
     document.getElementById("m-time-explore").textContent = fmtDur(sd.EXPLORE);
     document.getElementById("m-time-retrain").textContent = fmtDur(sd.RETRAIN);
     document.getElementById("m-time-think").textContent = fmtDur(sd.THINK);
     const totalDur = Object.values(sd).reduce((a, b) => a + (Number(b) || 0), 0);
     document.getElementById("m-time-total").textContent = fmtDur(totalDur);
+
+    // --- Scene state (min-data experiment tiles) ---
+    const ss = s.scene_state || { scene_idx: 0, scenes_seen: 1, eps_per_scene: {} };
+    document.getElementById("m-scene-idx").textContent = String(ss.scene_idx ?? 0);
+    document.getElementById("m-scenes-seen").textContent = String(ss.scenes_seen ?? 1);
+    const epsCurrent = (ss.eps_per_scene || {})[String(ss.scene_idx ?? 0)] || 0;
+    document.getElementById("m-eps-current-scene").textContent = String(epsCurrent);
+
+    // --- wide_verify vs scenes_seen chart ---
+    // Each point = one accepted retrain. X = # scenes seen at that
+    // retrain, Y = wide_verify_mse. Reveals the generalization curve
+    // the min-data experiment is sweeping.
+    const wvSeries = (s.wide_verify_vs_scenes || []).map(p => ({
+      x: p.scenes_seen, y: p.wide_verify_mse,
+    }));
+    document.getElementById("wv-vs-scenes-chart").innerHTML = lineChart(
+      wvSeries, 800, 200,
+    );
 
     // --- Scene-change banner (IDLE = human-in-the-loop) ---
     // Show the Scene-ready button whenever the learner is actually in
@@ -1106,7 +1211,8 @@ async function poll() {
     const banner = document.getElementById("scene-banner");
     const sceneText = document.getElementById("scene-banner-text");
     const readyBtn = document.getElementById("btn-scene-ready");
-    if (s.current_state === "IDLE") {
+    const sceneActive = (s.current_state === "IDLE") || !!(s.scene_change && s.scene_change.description);
+    if (sceneActive) {
       banner.style.display = "block";
       if (s.scene_change && s.scene_change.description) {
         sceneText.textContent = s.scene_change.description;
@@ -1117,6 +1223,22 @@ async function poll() {
     } else {
       banner.style.display = "none";
     }
+
+    // --- Scene-change counter + tab-title alert ---
+    // The counter card shows total scene-change requests so the operator
+    // (and the advisor in its prompt) can see how often the loop has
+    // pulled the human in. The tab title flips to "[!] Scene change
+    // needed …" while a request is open so the alert is visible from
+    // any background tab.
+    const counts = s.scene_change_counts || { requested: 0, acknowledged: 0 };
+    const sceneCountEl = document.getElementById("m-scene-changes");
+    if (counts.requested === counts.acknowledged) {
+      sceneCountEl.textContent = String(counts.requested);
+    } else {
+      sceneCountEl.innerHTML = `${counts.requested} <span style="color:var(--warn);font-size:10px;">● pending</span>`;
+    }
+    const baseTitle = "canvas-autonomous-learner — live";
+    document.title = sceneActive ? `[!] Scene change needed — ${baseTitle}` : baseTitle;
 
     // --- Training dataset viewer ---
     datasetViewerState.batches = s.training_datasets || [];
@@ -1491,9 +1613,25 @@ def _scene_change(events: list[dict]) -> dict | None:
     """Latest open scene-change request (a `claude_scene_change_requested`
     without a matching `scene_ready_acknowledged` afterwards). Used by
     the dashboard banner so the human sees Claude's instructions.
+
+    Cross-session staleness guard: ignore any request whose timestamp
+    predates the most recent `experiment_start`. A request that fired
+    in a prior session and was never acknowledged would otherwise stick
+    in the banner forever, even though the next launch's orchestrator
+    is no longer awaiting it (in-flight `pending_wide_verify` is in-
+    process state, not persisted across restarts). Without this, a
+    stuck-and-restarted session would show a phantom banner that no
+    longer corresponds to anything the learner is blocked on.
     """
+    last_start_t = 0.0
+    for e in events:
+        if e.get("event") == "experiment_start":
+            last_start_t = max(last_start_t, float(e.get("t", 0.0) or 0.0))
     for e in reversed(events):
         ev = e.get("event")
+        t = float(e.get("t", 0.0) or 0.0)
+        if t < last_start_t:
+            return None
         if ev == "scene_ready_acknowledged":
             return None
         if ev == "claude_scene_change_requested":
@@ -1503,6 +1641,22 @@ def _scene_change(events: list[dict]) -> dict | None:
                 "cycle": e.get("cycle"),
             }
     return None
+
+
+def _scene_change_counts(events: list[dict]) -> dict:
+    """Cumulative scene-change request and ack counts across the session.
+
+    The advisor sees the same numbers in its context snapshot; the
+    dashboard surfaces them so the operator can sanity-check how often
+    they've been pulled into the loop.
+    """
+    requested = sum(
+        1 for e in events if e.get("event") == "claude_scene_change_requested"
+    )
+    acknowledged = sum(
+        1 for e in events if e.get("event") == "scene_ready_acknowledged"
+    )
+    return {"requested": requested, "acknowledged": acknowledged}
 
 
 def _current_phase(events: list[dict]) -> str | None:
@@ -1543,6 +1697,19 @@ def _stage_durations(events: list[dict]) -> dict:
     successive transitions to the preceding state. The most recent
     state is credited up to `now` so counters tick live even while the
     state hasn't transitioned yet.
+
+    Adds an `OPERATOR_WAIT` virtual bucket: the sum of wide-verify
+    scene-change waits (where the loop was blocked in
+    `prompt_dashboard()` waiting for the operator to click "Scene
+    ready"). These periods are nominally inside the VERIFY state but
+    the GPU/robot are idle — bucketing them separately surfaces the
+    "human is the bottleneck" signal that previously hid inside a
+    growing VERIFY counter. The wait time is also subtracted from
+    VERIFY so the two buckets sum to the original total.
+
+    `OPERATOR_WAIT` covers wide-verify only. IDLE-path scene changes
+    (state=IDLE) are deliberately left in IDLE — IDLE is correctly
+    named for that case.
     """
     totals: dict[str, float] = {}
     last_state: Optional[str] = None
@@ -1561,6 +1728,63 @@ def _stage_durations(events: list[dict]) -> dict:
         totals[last_state] = totals.get(last_state, 0.0) + max(
             0.0, time.time() - last_t
         )
+
+    # Operator-wait pass — wide-verify only. Pair each scene-change
+    # request (source=wide_verify) with its acknowledgement and sum
+    # (acknowledged_at - requested_at). For an unacknowledged request
+    # in flight, fall back to the latest `idle_waiting_for_scene_ready`
+    # heartbeat's `elapsed_s` so the live counter ticks while the
+    # operator is still away.
+    #
+    # Cross-session live-tick guard: only treat the latest unanswered
+    # request as "still waiting" if it fired in the CURRENT session
+    # (i.e. after the latest `experiment_start`). Otherwise the live
+    # counter would inflate by hours/days every time a session crashed
+    # mid-wide-verify and was relaunched. Closed waits from prior
+    # sessions are still summed into the historical total, just not
+    # treated as in-flight.
+    last_start_t = 0.0
+    for e in events:
+        if e.get("event") == "experiment_start":
+            last_start_t = max(last_start_t, float(e.get("t", 0.0) or 0.0))
+    operator_wait = 0.0
+    pending_request: Optional[dict] = None
+    for e in events:
+        ev = e.get("event")
+        if ev == "claude_scene_change_requested" and e.get("source") == "wide_verify":
+            pending_request = e
+            continue
+        if ev == "scene_ready_acknowledged" and e.get("source") == "wide_verify":
+            if pending_request is not None:
+                req_t = float(pending_request.get("t", 0.0) or 0.0)
+                ack_t = float(e.get("acknowledged_at", e.get("t", 0.0)) or 0.0)
+                operator_wait += max(0.0, ack_t - req_t)
+                pending_request = None
+            continue
+    # Unacknowledged in-flight wait: only count if it's from the live
+    # session. Otherwise the request is dead — the orchestrator is no
+    # longer in `prompt_dashboard()`, so there is no live wait to tick.
+    if pending_request is not None:
+        req_t = float(pending_request.get("t", 0.0) or 0.0)
+        if req_t >= last_start_t:
+            latest_elapsed = 0.0
+            for e in events:
+                if (
+                    e.get("event") == "idle_waiting_for_scene_ready"
+                    and e.get("source") == "wide_verify"
+                    and float(e.get("t", 0.0) or 0.0) >= req_t
+                ):
+                    latest_elapsed = max(latest_elapsed, float(e.get("elapsed_s", 0.0) or 0.0))
+            # Also allow a "live tick" past the last heartbeat by using
+            # now-req_t when no heartbeat has fired yet.
+            live_elapsed = max(0.0, time.time() - req_t)
+            operator_wait += max(latest_elapsed, live_elapsed)
+
+    if operator_wait > 0:
+        # Subtract from VERIFY so the buckets sum to the original total.
+        verify = float(totals.get("VERIFY", 0.0))
+        totals["VERIFY"] = max(0.0, verify - operator_wait)
+        totals["OPERATOR_WAIT"] = operator_wait
     return totals
 
 
@@ -1964,6 +2188,79 @@ def _read_arm_a_result(runs_dir: Path) -> float | None:
     return float(val) if val is not None else None
 
 
+def _read_registry_scene_state(runs_dir: Path) -> dict:
+    """Pull scene_idx + eps_per_scene from the live registry.
+
+    These fields are the orchestrator's source of truth for the
+    min-data experiment. Reading registry.json directly (rather than
+    deriving from events) keeps the dashboard accurate across crashes
+    and process restarts where the events file may have stale data.
+    Returns `{"scene_idx": 0, "scenes_seen": 1, "eps_per_scene": {}}`
+    if the registry is missing or unreadable.
+    """
+    path = runs_dir / "registry.json"
+    fallback = {"scene_idx": 0, "scenes_seen": 1, "eps_per_scene": {}}
+    if not path.exists():
+        return fallback
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return fallback
+    scene_idx = int(data.get("scene_idx", 0) or 0)
+    eps_per_scene = data.get("eps_per_scene", {}) or {}
+    if not isinstance(eps_per_scene, dict):
+        eps_per_scene = {}
+    eps_per_scene_int = {str(k): int(v) for k, v in eps_per_scene.items()}
+    # scenes_seen counts the current scene plus all prior scenes that
+    # actually had eps recorded against them. scene_idx alone can be
+    # ahead of this if the operator just acked but hasn't collected
+    # yet — both numbers are meaningful so we expose both.
+    scenes_seen = max(
+        scene_idx + 1,
+        len([k for k, v in eps_per_scene_int.items() if v > 0]),
+    )
+    return {
+        "scene_idx": scene_idx,
+        "scenes_seen": scenes_seen,
+        "eps_per_scene": eps_per_scene_int,
+    }
+
+
+def _wide_verify_vs_scenes(events: list[dict], runs_dir: Path) -> list[dict]:
+    """Pair each accepted retrain's wide_verify_mse with the scene_idx
+    that was current when the retrain ran.
+
+    Walks events forward, tracking the most recent scene_idx (from
+    `scene_ready_acknowledged` IDLE-path events), and emits one entry
+    per `checkpoint_swapped` event that carries a wide_verify_mse.
+    Output is the data series for the dashboard's `wide_verify vs
+    num_scenes` chart — exactly the curve the min-data experiment is
+    trying to surface.
+    """
+    series: list[dict] = []
+    current_scene = 0
+    for e in events:
+        ev = e.get("event")
+        if ev == "scene_ready_acknowledged" and e.get("source") != "wide_verify":
+            si = e.get("scene_idx")
+            if si is not None:
+                current_scene = int(si)
+        elif ev == "checkpoint_swapped":
+            wv = e.get("wide_verify_mse")
+            if wv is not None:
+                series.append({
+                    "cycle": int(e.get("cycle", 0) or 0),
+                    "scene_idx": current_scene,
+                    "scenes_seen": current_scene + 1,
+                    "wide_verify_mse": float(wv),
+                    "locked_val_mse": (
+                        float(e.get("locked_val_mse"))
+                        if e.get("locked_val_mse") is not None else None
+                    ),
+                })
+    return series
+
+
 def _infer_context_from_events(events: list[dict]) -> dict:
     """Try to reconstruct the control joint + full-range bounds + thresholds
     from events the learner emits at startup. Falls back to defaults if
@@ -1995,9 +2292,14 @@ def _infer_context_from_events(events: list[dict]) -> dict:
 
 
 def build_state_payload(runs_dir: Path) -> dict:
+    # Experiment name = the runs_dir basename (e.g. "red_kong_min_data_500m"
+    # for `runs/red_kong_min_data_500m/`). Surfaces in the dashboard header
+    # so the operator can tell at a glance which experiment they're looking
+    # at — important when multiple configs share the same hardware.
+    experiment = runs_dir.name
     session = _latest_session(runs_dir)
     if session is None:
-        return {"session": None, "probes": [], "events": []}
+        return {"session": None, "experiment": experiment, "probes": [], "events": []}
     events_path = runs_dir / f"events_{session}.jsonl"
     examples_dir = runs_dir / f"examples_{session}"
     events = _read_events(events_path)
@@ -2028,12 +2330,16 @@ def build_state_payload(runs_dir: Path) -> dict:
     counts = _probe_counts(events, current_cycle)
     action_counts = _explore_action_counts(events, current_cycle)
     stage_durations = _stage_durations(events)
+    scene_state = _read_registry_scene_state(runs_dir)
+    wv_vs_scenes = _wide_verify_vs_scenes(events, runs_dir)
 
     return {
         "session": session,
+        "experiment": experiment,
         "current_state": _current_state(events),
         "current_phase": _current_phase(events),
         "scene_change": _scene_change(events),
+        "scene_change_counts": _scene_change_counts(events),
         "thinking": _thinking(events),
         "cycle_count": exp["cycle_count"],
         "retrain_count": exp["retrain_count"],
@@ -2068,6 +2374,8 @@ def build_state_payload(runs_dir: Path) -> dict:
         "joint_state_series": _joint_state_series(events, window=60),
         "stage_durations": stage_durations,
         "training_datasets": _training_datasets(runs_dir),
+        "scene_state": scene_state,
+        "wide_verify_vs_scenes": wv_vs_scenes,
     }
 
 

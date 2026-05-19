@@ -1,0 +1,195 @@
+# red_kong_min_data_500m — minimum-data-for-generalization experiment at
+# ~500M params, the middle-ground model size between 100M (hits noise
+# floor at low data; gap ≈ 1×) and 1B (extreme overfitting at limited
+# scenes; gap ≈ 13.5×).
+#
+# Why 500M for this experiment:
+#   - 1B's overfitting gap is so large (train_val 0.0008 vs locked_val
+#     0.011 = 13.5× in red_kong_1b at 745 eps × 3 scenes) that gap-
+#     closing dynamics are hard to read quantitatively. 500M should
+#     start with a smaller gap (~3-5×) that moves through an
+#     interpretable range as scenes grow.
+#   - Cold-start time at 1B is ~3.7h on this hardware. 500M without
+#     grad-checkpointing / 8bit-adam is ~1.5-2h. 30-scene sweep
+#     finishes in ~45-60h instead of 110h.
+#   - 500M fits on a 32GB 5090 in plain bf16 without the engineering
+#     acrobatics 1B requires. The prior 1B session had multiple
+#     memory_abort and throughput_collapse events — those mostly go
+#     away at 500M.
+#
+# Architecture: depth 24 × embed_dim 1280 × num_heads 20 ≈ 470M params
+# at patch_size 16. Plus heads + embeddings + canvas tokens lands near
+# 500M total.
+#
+# To launch (FRESH cold-start):
+#   python -m learner --config configs/red_kong_min_data_500m.yaml
+
+paths:
+  canvas_world_model: ../canvas-world-model
+  canvas_robot_control: ../canvas-robot-control
+  robotic_foundation_model_tests: ../robotic-foundation-model-tests
+  base_canvas: null
+  val_dataset: null
+  locked_val_shoulder: ./datasets/locked_val_red_kong/shoulder
+  locked_val_elbow: null
+  locked_val_dataset: ./datasets/locked_val_red_kong/shoulder
+  live_checkpoint: null
+  ckpt_dir: ./runs/red_kong_min_data_500m/checkpoints
+  canvas_out: ./runs/red_kong_min_data_500m/canvas
+  lerobot_out: ./runs/red_kong_min_data_500m/lerobot
+  runs_dir: ./runs/red_kong_min_data_500m
+  registry_file: ./runs/red_kong_min_data_500m/registry.json
+  python: C:/Projects/pythonenv-lerobot/Scripts/python.exe
+
+robot:
+  port: COM3
+  robot_id: my_so101_follower
+  control_joint: shoulder_pan
+  step_size: 10.0
+  joint_min: -60.0
+  joint_max: 60.0
+  base_camera: 1
+  wrist_camera: 0
+  camera_width: 640
+  camera_height: 480
+  camera_fps: 10
+  home:
+    shoulder_pan: 21.07
+    shoulder_lift: -100.00
+    elbow_flex: 94.92
+    wrist_flex: 31.82
+    wrist_roll: 5.12
+    gripper: 10.13
+
+thresholds:
+  tau_low: 0.005
+  tau_high: 0.008
+  val_guard: 1.5
+  max_consecutive_rejections: 3
+
+cadence:
+  idle_seconds: 0
+  lifelong_mode: true
+  # Advisor ENABLED. Earlier versions of this config disabled it for
+  # "deterministic cadence", but that broke two things: (1) wide_verify
+  # never fired automatically, leaving the held-out corpus empty and
+  # the primary generalization metric uncomputed, and (2) crash
+  # recovery (memory_abort / throughput_collapse / stall) lost its
+  # routing back through THINK, so a single failure looped. The
+  # scene-rotation cadence — the actual controlled variable — is
+  # already deterministic via `scene_change_after_accepted_retrain`
+  # below, which fires regardless of advisor state. Keep advisor on
+  # for the rare paths (crash recovery, plateau, wide_verify
+  # scheduling) where judgment matters.
+  claude_advisor_enabled: true
+  claude_max_consecutive_retrains: 5
+  claude_advisor_crash_timeout_s: 1800
+  claude_advisor_model: opus
+  claude_advisor_effort: max
+  # Defense-in-depth wide_verify schedule: even if the advisor never
+  # picks wide_verify_next, fire one every 5 accepted retrains so the
+  # held-out corpus grows on a predictable cadence. Each fire pulls
+  # the operator in for 3 scene-setups (held-out scenes), separate
+  # from the per-cycle IDLE-path scene rotation that grows training.
+  wide_verify_every: 5
+  wide_verify_scenes: 3
+  per_joint_targeting: true
+  scene_change_after_accepted_retrain: true
+  probes_per_verify: 6
+  window_size: 24
+  settle_time: 0.5
+  # Fixed 100 eps/scene budget so num_scenes is the controlled axis.
+  base_explore_batch_size: 100
+  explore_batch_size_min: 100
+  explore_batch_size_max: 100
+  max_sub_bursts: 4
+  min_sub_burst_size: 25
+  cold_start_epochs: 30
+  ft_epochs: 20
+  early_stop_patience: 6
+  max_consecutive_cold_starts: 2
+  cold_start_cap_wide_verify_regress_ratio: 1.15
+  parallel_record_during_retrain_episodes: 0
+  safety_cap_episodes: 5000
+  warmup_cycles: 2
+  explore_max_retries: 2
+  explore_retry_backoff: 10.0
+  training_stall_timeout_s: 1800
+  retrain_timeout_s: 14400
+
+gpu:
+  # 500M with bf16 + plain AdamW fits in ~14-18GB on the 5090; leaves
+  # plenty of headroom. Drop the abort/warn fractions so a transient
+  # spike doesn't kill the run unnecessarily.
+  memory_fraction: 0.90
+  memory_abort_frac: 0.97
+  memory_warn_frac: 0.93
+  sample_interval_s: 5.0
+
+range:
+  enabled: false
+
+training:
+  # ~470M params: 12 × 24 × 1280² ≈ 471M for the transformer trunk;
+  # patch + position embeddings + canvas head bring total to ~500M.
+  patch_size: 16
+  embed_dim: 1280
+  depth: 24
+  num_heads: 20
+
+  # 500M with bf16 alone — but batch_size=2 hit memory_abort at 98%
+  # VRAM during fine-tune (cold-start fits because optimizer state is
+  # fresh; ft loads existing AdamW state which pushes peak past
+  # memory_abort_frac=0.97). Drop to batch_size=1 with grad_accum=4
+  # for the same effective batch=4. If memory turns out to have
+  # headroom across many cycles, batch_size 2 with grad_accum 2 can
+  # be re-tried later via runtime overrides.
+  bf16: true
+  gradient_checkpointing: false
+  use_8bit_adam: false
+  batch_size: 1
+  gradient_accumulation_steps: 4   # effective batch = 4
+
+  num_train_timesteps: 1000
+  beta_schedule: cosine
+  prediction_type: sample
+
+  lr: 3.0e-4
+  weight_decay: 0.01
+  lr_schedule: cosine
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+  seed: 42
+  val_ratio: 0.1
+
+  motor_bounds:
+    motor_norm_min: [-100.0, -100.0, -100.0, -100.0, -100.0, -100.0]
+    motor_norm_max: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
+
+actions:
+  candidates: [1, 2, 3]
+  probe_weights: null
+
+explore:
+  vary_target_joint: false
+  joint_ranges:
+    shoulder_pan.pos: [-60.0, 60.0]
+  policy_joint_name: shoulder_pan.pos
+  action_duration: 1.0
+  start_buffer: 2.5
+  dataset_fps: 10
+  base_camera_name: base_0_rgb
+  wrist_camera_name: left_wrist_0_rgb
+  repo_id_prefix: red_kong_min_data_500m/autonomous-explore
+  inactive_joint_positions:
+    shoulder_lift: -100.00
+    elbow_flex: 94.92
+    wrist_flex: 31.82
+    wrist_roll: 5.12
+    gripper: 10.13
+
+verify:
+  repo_id_prefix: red_kong_min_data_500m/autonomous-verify
+
+dry_run: false

@@ -1,0 +1,182 @@
+# red_kong_min_data_250m — minimum-data-for-generalization experiment at
+# ~250M params. Successor to the abandoned 500M attempt that hit
+# `training_memory_abort` at 98% VRAM on its first fine-tune cycle even
+# at batch_size=1 — VRAM headroom matters more than parameter count for
+# experiment reliability.
+#
+# Why 250M (vs the prior 500M / 1B options):
+#   - VRAM safety: 250M trunk + activations + AdamW state ≈ ~14-18GB
+#     on a 32GB 5090, leaving ~14GB headroom. No memory_abort risk
+#     across the 30-scene sweep.
+#   - Cycle time: ~45-60 min cold-start, ~15-20 min warm fine-tune.
+#     30-scene sweep finishes in ~20-25h (single overnight + half a
+#     day) instead of 500M's ~60h.
+#   - Capacity headroom: ~2.5× the 100M sim config (which hit noise-
+#     floor saturation, train/val gap ~1×). Should show ~3-5× gap at
+#     low scene counts — interpretable gap-closing curve as scenes
+#     grow.
+#   - Engineering simplicity: bf16 alone, no grad-checkpointing, no
+#     8-bit Adam. Can run batch_size=4 for real throughput.
+#
+# Architecture: depth 20 × embed_dim 1024 × num_heads 16 ≈ 252M trunk
+# at patch_size 16 (12 × 20 × 1024² ≈ 252M for QKV+FFN). Plus patch +
+# position embeddings + canvas head ≈ 270M total.
+#
+# To launch (FRESH cold-start):
+#   python -m learner --config configs/red_kong_min_data_250m.yaml
+
+paths:
+  canvas_world_model: ../canvas-world-model
+  canvas_robot_control: ../canvas-robot-control
+  robotic_foundation_model_tests: ../robotic-foundation-model-tests
+  base_canvas: null
+  val_dataset: null
+  locked_val_shoulder: ./datasets/locked_val_red_kong/shoulder
+  locked_val_elbow: null
+  locked_val_dataset: ./datasets/locked_val_red_kong/shoulder
+  live_checkpoint: null
+  ckpt_dir: ./runs/red_kong_min_data_250m/checkpoints
+  canvas_out: ./runs/red_kong_min_data_250m/canvas
+  lerobot_out: ./runs/red_kong_min_data_250m/lerobot
+  runs_dir: ./runs/red_kong_min_data_250m
+  registry_file: ./runs/red_kong_min_data_250m/registry.json
+  python: C:/Projects/pythonenv-lerobot/Scripts/python.exe
+
+robot:
+  port: COM3
+  robot_id: my_so101_follower
+  control_joint: shoulder_pan
+  step_size: 10.0
+  joint_min: -60.0
+  joint_max: 60.0
+  base_camera: 1
+  wrist_camera: 0
+  camera_width: 640
+  camera_height: 480
+  camera_fps: 10
+  home:
+    shoulder_pan: 21.07
+    shoulder_lift: -100.00
+    elbow_flex: 94.92
+    wrist_flex: 31.82
+    wrist_roll: 5.12
+    gripper: 10.13
+
+thresholds:
+  tau_low: 0.005
+  tau_high: 0.008
+  val_guard: 1.5
+  max_consecutive_rejections: 3
+
+cadence:
+  idle_seconds: 0
+  lifelong_mode: true
+  # Advisor enabled for crash recovery, periodic wide_verify scheduling,
+  # and adaptive routing. Scene-rotation cadence — the actual controlled
+  # variable for this experiment — is locked deterministically by
+  # `scene_change_after_accepted_retrain` below regardless of advisor
+  # state. See configs/red_kong_min_data_500m.yaml header comment for
+  # the rationale on why disabling the advisor was a mistake.
+  claude_advisor_enabled: true
+  claude_max_consecutive_retrains: 5
+  claude_advisor_crash_timeout_s: 1800
+  claude_advisor_model: opus
+  claude_advisor_effort: max
+  wide_verify_every: 5
+  wide_verify_scenes: 3
+  per_joint_targeting: true
+  scene_change_after_accepted_retrain: true
+  probes_per_verify: 6
+  window_size: 24
+  settle_time: 0.5
+  # Fixed 100 eps/scene budget — num_scenes is the controlled axis.
+  base_explore_batch_size: 100
+  explore_batch_size_min: 100
+  explore_batch_size_max: 100
+  max_sub_bursts: 4
+  min_sub_burst_size: 25
+  cold_start_epochs: 30
+  ft_epochs: 20
+  early_stop_patience: 6
+  max_consecutive_cold_starts: 2
+  cold_start_cap_wide_verify_regress_ratio: 1.15
+  parallel_record_during_retrain_episodes: 0
+  safety_cap_episodes: 5000
+  warmup_cycles: 2
+  explore_max_retries: 2
+  explore_retry_backoff: 10.0
+  training_stall_timeout_s: 1800
+  retrain_timeout_s: 14400
+
+gpu:
+  # 250M leaves ~14GB headroom on the 32GB 5090. Drop the abort
+  # threshold tighter than the 500M run (no longer trying to squeeze
+  # the last few percent of VRAM) and the warn frac correspondingly.
+  memory_fraction: 0.85
+  memory_abort_frac: 0.92
+  memory_warn_frac: 0.85
+  sample_interval_s: 5.0
+
+range:
+  enabled: false
+
+training:
+  # ~252M params: 12 × 20 × 1024² ≈ 252M for the transformer trunk;
+  # patch + position embeddings + canvas head bring total to ~270M.
+  patch_size: 16
+  embed_dim: 1024
+  depth: 20
+  num_heads: 16
+
+  # 250M with bf16 fits comfortably; can run batch_size=4 directly
+  # without gradient accumulation for ~4× throughput vs the 500M
+  # config's effective batch of 4 via accum.
+  bf16: true
+  gradient_checkpointing: false
+  use_8bit_adam: false
+  batch_size: 4
+  gradient_accumulation_steps: 1   # effective batch = 4
+
+  num_train_timesteps: 1000
+  beta_schedule: cosine
+  prediction_type: sample
+
+  lr: 3.0e-4
+  weight_decay: 0.01
+  lr_schedule: cosine
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+  seed: 42
+  val_ratio: 0.1
+
+  motor_bounds:
+    motor_norm_min: [-100.0, -100.0, -100.0, -100.0, -100.0, -100.0]
+    motor_norm_max: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
+
+actions:
+  candidates: [1, 2, 3]
+  probe_weights: null
+
+explore:
+  vary_target_joint: false
+  joint_ranges:
+    shoulder_pan.pos: [-60.0, 60.0]
+  policy_joint_name: shoulder_pan.pos
+  action_duration: 1.0
+  start_buffer: 2.5
+  dataset_fps: 10
+  base_camera_name: base_0_rgb
+  wrist_camera_name: left_wrist_0_rgb
+  repo_id_prefix: red_kong_min_data_250m/autonomous-explore
+  inactive_joint_positions:
+    shoulder_lift: -100.00
+    elbow_flex: 94.92
+    wrist_flex: 31.82
+    wrist_roll: 5.12
+    gripper: 10.13
+
+verify:
+  repo_id_prefix: red_kong_min_data_250m/autonomous-verify
+
+dry_run: false

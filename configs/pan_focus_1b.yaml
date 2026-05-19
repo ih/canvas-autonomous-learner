@@ -1,4 +1,11 @@
-# 1B-parameter scale-up of the simultaneous arm.
+# pan_focus_1b — fresh 1B cold-start, shoulder_pan as the policy joint.
+#
+# Experiment goal: train a 1B world model from scratch where shoulder_pan
+# is the ONLY policy/eval joint. elbow_flex stays in the explore pool
+# purely as a data-diversity source (`vary_target_joint=true` makes the
+# recorder pick a target joint uniformly per episode), so the model sees
+# scenes where the elbow has moved without elbow being a learning target.
+#
 # Architecture: depth=28 / embed_dim=1408 / num_heads=22 → ~1.02B params.
 # Training mechanics required to fit on a 32GB 5090:
 #   - bf16 mixed precision (forward/backward in bf16, master weights fp32)
@@ -6,16 +13,15 @@
 #   - bitsandbytes AdamW8bit optimizer state
 #   - batch_size=1 with gradient_accumulation_steps=4 (effective batch=4)
 #
-# Cold-start only — no prior 1B checkpoint exists. ft_epochs reduced for
-# tractable autonomous-learner cycles; cold_start_epochs reduced because
-# the cold-start canvas dataset is small and we just want pipeline
-# validation, not convergence to publication quality.
+# Cold-start: live_checkpoint is null and runs/pan_focus_1b/ does not
+# exist on the first launch, so the orchestrator's cycle 0 takes the
+# from-scratch path with `cold_start_epochs`.
 #
-# Streaming + per-joint targeting both ON. Advisor disabled to skip
-# Claude THINK overhead on each cycle (the advisor's training overrides
-# would also clobber the 1B-specific hparams).
+# To launch:
+#   python -m learner --config configs/pan_focus_1b.yaml
 #
-# Restore production: switch --config back to simultaneous.yaml.
+# Best checkpoint will appear in the live dashboard as
+# "best pan_focus_1b (val_mse=...)" once at least one RETRAIN succeeds.
 
 paths:
   canvas_world_model: ../canvas-world-model
@@ -27,11 +33,11 @@ paths:
   locked_val_elbow: ./datasets/locked_val/elbow
   locked_val_dataset: ./datasets/locked_val/shoulder
   live_checkpoint: null
-  ckpt_dir: ./runs/sim_1b/checkpoints
-  canvas_out: ./runs/sim_1b/canvas
-  lerobot_out: ./runs/sim_1b/lerobot
-  runs_dir: ./runs/sim_1b
-  registry_file: ./runs/sim_1b/registry.json
+  ckpt_dir: ./runs/pan_focus_1b/checkpoints
+  canvas_out: ./runs/pan_focus_1b/canvas
+  lerobot_out: ./runs/pan_focus_1b/lerobot
+  runs_dir: ./runs/pan_focus_1b
+  registry_file: ./runs/pan_focus_1b/registry.json
   python: C:/Projects/pythonenv-lerobot/Scripts/python.exe
 
 robot:
@@ -62,12 +68,10 @@ thresholds:
 
 cadence:
   idle_seconds: 0
-  # Advisor has full reign over architecture + mechanics now — the
-  # apply_cfg_overrides freeze on depth/embed_dim/num_heads/patch_size/
-  # batch_size/bf16/... was lifted. The advisor is responsible for
-  # pairing any state_dict-shape-changing override with `from_scratch:
-  # true` so the next training subprocess rebuilds fresh rather than
-  # crashing on a mismatched checkpoint load.
+  # Advisor has full reign over architecture + mechanics. The advisor is
+  # responsible for pairing any state_dict-shape-changing override with
+  # `from_scratch: true` so the next training subprocess rebuilds fresh
+  # rather than crashing on a mismatched checkpoint load.
   claude_advisor_enabled: true
   claude_max_consecutive_retrains: 5
   claude_advisor_crash_timeout_s: 1800
@@ -77,10 +81,6 @@ cadence:
   probes_per_verify: 6
   window_size: 24
   settle_time: 0.5
-  # Roomier explore budget so the advisor can act on a sustained
-  # data-bound diagnosis instead of being throttled by tight caps.
-  # Effective ceiling: up to 240 episodes per EXPLORE, split across
-  # up to 8 sub-bursts targeting the worst (joint, position-bin) cells.
   base_explore_batch_size: 40
   explore_batch_size_min: 20
   explore_batch_size_max: 240
@@ -98,13 +98,11 @@ cadence:
 
 gpu:
   # 1B fine-tune at bf16 + grad-ckpt + 8-bit Adam peaks at ~31.9 GB on
-  # the 5090's 32 GB. Spillover to host-shared memory begins above ~95%
-  # — at that point CUDA does NOT raise OOM; it silently moves working
-  # set across the PCIe bus and per-epoch wall time goes 10-100x. The
-  # train_diffusion.py `--gpu-mem-fraction 0.95` cap forces a clean OOM
-  # at 95% so the trainer crashes deterministically, but this 0.96
-  # sustained-pressure abort is the backstop for any allocation path
-  # that bypasses the PyTorch allocator (bnb 8-bit kernels, CUDA ctx).
+  # the 5090's 32 GB. Spillover to host-shared memory above ~95% does
+  # NOT raise OOM — CUDA silently moves working set over PCIe and
+  # per-epoch wall time collapses 10-100x. train_diffusion.py's
+  # `--gpu-mem-fraction 0.95` forces a clean OOM at 95%; this 0.96
+  # nvidia-smi-driven abort is the backstop for non-allocator paths.
   memory_abort_frac: 0.96
   memory_warn_frac: 0.93
   sample_interval_s: 5.0
@@ -151,6 +149,10 @@ actions:
   probe_weights: null
 
 explore:
+  # Pooled two-joint exploration. The single_action policy picks a target
+  # joint uniformly from `joints` each episode and ONLY that joint moves
+  # during the recorded action. shoulder_pan is the policy/eval joint;
+  # elbow_flex is here purely to diversify the visual scene.
   vary_target_joint: true
   joints:
     - shoulder_pan.pos
@@ -164,7 +166,10 @@ explore:
   dataset_fps: 10
   base_camera_name: base_0_rgb
   wrist_camera_name: left_wrist_0_rgb
-  repo_id_prefix: sim_1b/autonomous-explore
+  # Distinct prefix so this experiment's HF cache doesn't co-mingle with
+  # sim_1b's. Anything written under runs/pan_focus_1b/ stays scoped to
+  # this experiment.
+  repo_id_prefix: pan_focus_1b/autonomous-explore
   inactive_joint_positions:
     shoulder_lift: -100.00
     wrist_flex: 31.82
@@ -172,6 +177,6 @@ explore:
     gripper: 10.13
 
 verify:
-  repo_id_prefix: sim_1b/autonomous-verify
+  repo_id_prefix: pan_focus_1b/autonomous-verify
 
 dry_run: false

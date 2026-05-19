@@ -1,0 +1,226 @@
+# red_kong_1b — fresh 1B cold-start, single-object scene (red Kong dog toy).
+#
+# Successor to pan_only_1b. Same architecture and lifelong-mode learning
+# protocol; the only differences are the object set (one red Kong dog
+# toy instead of pan_only_1b's multi-object set) and the scoped paths
+# (runs/red_kong_1b, datasets/locked_val_red_kong, red_kong_1b/* repo
+# IDs) so this experiment's data does not co-mingle with prior runs.
+#
+# Architecture: depth=28 / embed_dim=1408 / num_heads=22 → ~1.02B params.
+# Training mechanics required to fit on a 32GB 5090:
+#   - bf16 mixed precision (forward/backward in bf16, master weights fp32)
+#   - gradient checkpointing on every transformer block
+#   - bitsandbytes AdamW8bit optimizer state
+#   - batch_size=1 with gradient_accumulation_steps=4 (effective batch=4)
+# PyTorch allocator is capped at gpu.memory_fraction (0.95) inside the
+# trainer subprocess — keeps over-allocation surfacing as a clean OOM
+# rather than silent host-shared spillover.
+#
+# Cold-start: live_checkpoint is null and runs/red_kong_1b/ does not
+# exist on the first launch, so the orchestrator's cycle 0 takes the
+# from-scratch path with `cold_start_epochs`.
+#
+# Lifelong mode (cf. pan_only_1b header): routing is driven by
+# collected-data signals (rolling VERIFY mean_err, train/val curves,
+# novelty reports). locked_val is auxiliary context for the advisor;
+# the held-out cross-scene corpus (wide_verify) is the primary
+# generalization signal once seeded.
+#
+# To launch:
+#   python -m learner --config configs/red_kong_1b.yaml
+#
+# Best checkpoint will appear in the live dashboard as
+# "best red_kong_1b (val_mse=...)" once at least one RETRAIN succeeds.
+
+paths:
+  canvas_world_model: ../canvas-world-model
+  canvas_robot_control: ../canvas-robot-control
+  robotic_foundation_model_tests: ../robotic-foundation-model-tests
+  base_canvas: null
+  val_dataset: null
+  locked_val_shoulder: ./datasets/locked_val_red_kong/shoulder
+  # No elbow locked-val for this experiment (single-joint policy).
+  locked_val_elbow: null
+  locked_val_dataset: ./datasets/locked_val_red_kong/shoulder
+  live_checkpoint: null
+  ckpt_dir: ./runs/red_kong_1b/checkpoints
+  canvas_out: ./runs/red_kong_1b/canvas
+  lerobot_out: ./runs/red_kong_1b/lerobot
+  runs_dir: ./runs/red_kong_1b
+  registry_file: ./runs/red_kong_1b/registry.json
+  python: C:/Projects/pythonenv-lerobot/Scripts/python.exe
+
+robot:
+  port: COM3
+  robot_id: my_so101_follower
+  control_joint: shoulder_pan
+  step_size: 10.0
+  joint_min: -60.0
+  joint_max: 60.0
+  base_camera: 1
+  wrist_camera: 0
+  camera_width: 640
+  camera_height: 480
+  camera_fps: 10
+  home:
+    shoulder_pan: 21.07
+    shoulder_lift: -100.00
+    elbow_flex: 94.92
+    wrist_flex: 31.82
+    wrist_roll: 5.12
+    gripper: 10.13
+
+thresholds:
+  tau_low: 0.005
+  tau_high: 0.008
+  # In lifelong_mode the val_guard guards against a regression in the
+  # trainer's INTERNAL train/val split (best_val_loss ratio vs recent
+  # median), not against locked_val. Looser since internal val is
+  # noisier than locked-val.
+  val_guard: 1.5
+  max_consecutive_rejections: 3
+
+cadence:
+  idle_seconds: 0
+  # Lifelong learner: routing is driven by collected-data signals.
+  # locked-val (single red Kong scene) is auxiliary context for the
+  # advisor; the held-out cross-scene wide_verify corpus is the
+  # primary generalization signal once seeded. Plateau is a diagnostic
+  # signal — never an auto-termination trigger.
+  lifelong_mode: true
+  claude_advisor_enabled: true
+  claude_max_consecutive_retrains: 5
+  claude_advisor_crash_timeout_s: 1800
+  claude_advisor_model: opus
+  claude_advisor_effort: max
+  per_joint_targeting: true
+  probes_per_verify: 6
+  window_size: 24
+  settle_time: 0.5
+  # Bumped 3-5x after the May 2-4 session showed data starvation: 745 eps
+  # over 18 cycles meant ~47 eps/burst, paired with 1-3.7h retrains. Per
+  # new episode collected, ~90s of training compute — wildly skewed toward
+  # recompute on barely-grown data. Sizing larger so each cold-start has
+  # something new to chew on.
+  base_explore_batch_size: 150
+  explore_batch_size_min: 60
+  explore_batch_size_max: 720
+  max_sub_bursts: 8
+  min_sub_burst_size: 30
+  cold_start_epochs: 30
+  ft_epochs: 20
+  early_stop_patience: 6
+  # Cap on consecutive cold-start retrains. The May 2-4 session ran 4
+  # consecutive 1.5-3.7h cold-starts (cycles 14-17, ~10h GPU) at the
+  # advisor's request, while wide_verify mostly tracked sideways. After
+  # this many cold-starts in a row, downgrade to warm-start fine-tune
+  # unless wide_verify_mse regressed >X% from prior best (computed every
+  # retrain against the offline wide_verify_canvas/ corpus). Set to null
+  # to disable the cap.
+  max_consecutive_cold_starts: 2
+  cold_start_cap_wide_verify_regress_ratio: 1.15
+  # Concurrent recording during RETRAIN. The trainer subprocess holds
+  # the GPU for 1-3.7h at 1B; meanwhile the SO-101 + cameras sit idle.
+  # Spawn a fixed-budget recorder in parallel so the next cycle has
+  # fresh episodes already in the queue. Sized conservatively at ~10
+  # min of recording (600 eps × ~1s) so the recorder finishes before
+  # the trainer in essentially every cycle. Set to 0 to disable.
+  # Hardware contract: orchestrator disconnects/reconnects around the
+  # retrain window — see learner/background_recorder.py.
+  #
+  # Currently DISABLED for this experiment: data growth should come
+  # only from foreground EXPLORE bursts so we can cleanly attribute
+  # the model's generalization curve to a known eps/cycle rate. The
+  # background recorder pulls episodes from whatever scene is up
+  # during retrain, which adds trajectory volume but no scene
+  # diversity — the question we're trying to answer is "how many eps
+  # per scene-config does the model need", and bg recording would
+  # confound that.
+  parallel_record_during_retrain_episodes: 0
+  safety_cap_episodes: 3000
+  warmup_cycles: 2
+  explore_max_retries: 2
+  explore_retry_backoff: 10.0
+  training_stall_timeout_s: 1800
+  retrain_timeout_s: 14400      # 4h ceiling for any single retrain at 1B
+
+gpu:
+  # Spillover-safety stack (see pan_focus_1b.yaml for full rationale):
+  #   memory_fraction: 0.95   PyTorch allocator hard cap inside trainer
+  #                           — forces clean CUDA OOM at the cap.
+  #   memory_abort_frac: 0.96 nvidia-smi-driven backstop for paths that
+  #                           bypass the PyTorch allocator (bnb 8-bit
+  #                           kernels, CUDA context growth).
+  memory_fraction: 0.95
+  memory_abort_frac: 0.96
+  memory_warn_frac: 0.93
+  sample_interval_s: 5.0
+
+range:
+  enabled: false
+
+training:
+  # Architecture — 28 layers x 1408 wide ≈ 1.02B params at patch=16
+  patch_size: 16
+  embed_dim: 1408
+  depth: 28
+  num_heads: 22
+
+  # Training mechanics — all required at 1B on 32GB
+  bf16: true
+  gradient_checkpointing: true
+  use_8bit_adam: true
+  batch_size: 1
+  gradient_accumulation_steps: 4   # effective batch = 4
+
+  # Diffusion (unchanged from production)
+  num_train_timesteps: 1000
+  beta_schedule: cosine
+  prediction_type: sample
+
+  # Optimization
+  lr: 3.0e-4
+  weight_decay: 0.01
+  lr_schedule: cosine
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+  seed: 42
+  val_ratio: 0.1
+
+  # Lock motor-strip normalization at SO-101 hardware limits
+  motor_bounds:
+    motor_norm_min: [-100.0, -100.0, -100.0, -100.0, -100.0, -100.0]
+    motor_norm_max: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
+
+actions:
+  candidates: [1, 2, 3]
+  probe_weights: null
+
+explore:
+  # Single-joint exploration. shoulder_pan is the only joint the
+  # recorder ever moves; the policy_joint_name + vary_target_joint=false
+  # combo pins every recorded episode to shoulder_pan.pos. Scene
+  # diversity comes from advisor-requested rearrangements of the red
+  # Kong (cf. cadence.lifelong_mode behavior).
+  vary_target_joint: false
+  joint_ranges:
+    shoulder_pan.pos: [-60.0, 60.0]
+  policy_joint_name: shoulder_pan.pos
+  action_duration: 1.0
+  start_buffer: 2.5
+  dataset_fps: 10
+  base_camera_name: base_0_rgb
+  wrist_camera_name: left_wrist_0_rgb
+  repo_id_prefix: red_kong_1b/autonomous-explore
+  inactive_joint_positions:
+    shoulder_lift: -100.00
+    elbow_flex: 94.92
+    wrist_flex: 31.82
+    wrist_roll: 5.12
+    gripper: 10.13
+
+verify:
+  repo_id_prefix: red_kong_1b/autonomous-verify
+
+dry_run: false

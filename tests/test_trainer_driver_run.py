@@ -127,6 +127,56 @@ def test_run_raises_memory_abort_when_monitor_pressure(tmp_path):
     assert "training_memory_abort" in text
 
 
+# --------------------------------------------------- throughput-collapse abort
+
+
+def test_run_raises_throughput_collapse_when_epochs_slow_dramatically(tmp_path):
+    """A subprocess that emits 8 fast epoch lines (baseline) and then 3
+    very slow ones should trigger SubprocessThroughputCollapse, even
+    though the stall timer never fires because lines DO keep arriving.
+    """
+    log = EventLog(tmp_path, session="collapse_test")
+    cmd = [
+        sys.executable, "-u", "-c",
+        (
+            "import time\n"
+            # Baseline: 9 fast epochs (first gap is skipped → 8 gaps banked).
+            "for i in range(1, 10):\n"
+            "    print(f'Epoch {i}/100: train_loss=0.1, val_loss=0.1')\n"
+            "    time.sleep(0.1)\n"
+            # Collapse: 4 slow epochs at ~1.5s each (15x baseline) so the
+            # check (which needs warmup+3 banked gaps) trips on the third.\n
+            "for i in range(10, 14):\n"
+            "    print(f'Epoch {i}/100: train_loss=0.1, val_loss=0.1')\n"
+            "    time.sleep(1.5)\n"
+            "time.sleep(30)\n"
+        ),
+    ]
+    t0 = time.time()
+    with pytest.raises(trainer_driver.SubprocessThroughputCollapse) as ei:
+        trainer_driver._run(
+            cmd,
+            event_log=log,
+            tag="train_diffusion",
+            stall_timeout_s=60.0,
+            hard_timeout_s=60.0,
+            throughput_warmup_epochs=8,
+            throughput_collapse_factor=5.0,
+        )
+    elapsed = time.time() - t0
+    # Should bail shortly after the third slow epoch arrives, not wait
+    # for the trailing 30s sleep.
+    assert elapsed < 12.0
+    assert ei.value.tag == "train_diffusion"
+    assert ei.value.ratio >= 5.0
+    assert ei.value.recent_epoch_s > ei.value.baseline_epoch_s
+
+    events_path = Path(tmp_path) / "events_collapse_test.jsonl"
+    text = events_path.read_text()
+    assert "training_throughput_baseline" in text
+    assert "training_throughput_collapse" in text
+
+
 # ------------------------------------------------------ happy path still works
 
 

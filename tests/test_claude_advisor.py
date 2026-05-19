@@ -52,6 +52,44 @@ def test_parse_response_strips_ansi():
     assert claude_advisor.parse_response(raw) == {"next_state": "verify"}
 
 
+# ---------------------------------------------------- decision schema
+
+
+def test_decision_schema_accepts_prompt_improvement_suggestion():
+    """The decision schema should let advisors include a meta-reflection
+    on how the prompt could be improved, captured in the event log
+    alongside the routing decision."""
+    schema = claude_advisor._DECISION_SCHEMA
+    assert "prompt_improvement_suggestion" in schema["properties"]
+    assert schema["properties"]["prompt_improvement_suggestion"]["type"] == "string"
+    # Must be optional — absence of suggestion should not break parsing.
+    assert "prompt_improvement_suggestion" not in schema["required"]
+    # additionalProperties:False enforces that any other meta field
+    # name (e.g. an LLM hallucinating a sibling) gets rejected by
+    # the SDK's schema validator. Confirm this guardrail is intact.
+    assert schema["additionalProperties"] is False
+
+
+def test_decision_schema_round_trip_with_suggestion():
+    """A complete decision dict including the new field should
+    serialize and deserialize cleanly through json (the format the
+    advisor's structured_output envelope uses)."""
+    decision = {
+        "next_state": "retrain",
+        "reason": "compute-bound; extending epoch budget",
+        "training_overrides": {"cadence.ft_epochs": 80},
+        "prompt_improvement_suggestion": (
+            "When wide_verify is empty, also surface "
+            "auxiliary.locked_val_history[-1] / best_val ratio in the "
+            "scene-overfit triggers — same-scene VERIFY undercounts the gap."
+        ),
+    }
+    encoded = json.dumps(decision)
+    parsed = claude_advisor.parse_response(encoded)
+    assert parsed == decision
+    assert "prompt_improvement_suggestion" in parsed
+
+
 # ---------------------------------------------------- apply_cfg_overrides
 
 
@@ -106,13 +144,11 @@ def test_apply_cfg_overrides_clamps_nonpositive():
     assert cfg.training.lr > 0
 
 
-def test_apply_cfg_overrides_blocks_architecture_fields():
-    """Architecture-binding fields are frozen once a checkpoint exists.
-    The advisor must NOT be able to override depth/embed_dim/num_heads/
-    patch_size — doing so would mismatch the loaded state_dict at the
-    next --fine-tune and crash the train subprocess (history: depth=14→16
-    mismatch in the smoke run, and a likely crash for the 1B run if the
-    advisor proposed depth=16 against the depth=28 ckpt).
+def test_apply_cfg_overrides_allows_architecture_fields():
+    """Architecture-binding fields are advisor-tunable. The advisor is
+    responsible for pairing any state_dict-shape-changing override with
+    `from_scratch: true` so the next training subprocess rebuilds the
+    model fresh instead of crashing on a mismatched checkpoint load.
     """
     cfg = _training_cfg()
     cfg.training.depth = 28
@@ -128,7 +164,6 @@ def test_apply_cfg_overrides_blocks_architecture_fields():
     applied = claude_advisor.apply_cfg_overrides(
         cfg,
         {
-            # All blocked architecture-binding fields:
             "training.depth": 16,
             "training.embed_dim": 512,
             "training.num_heads": 16,
@@ -138,31 +173,28 @@ def test_apply_cfg_overrides_blocks_architecture_fields():
             "training.gradient_checkpointing": False,
             "training.use_8bit_adam": False,
             "training.gradient_accumulation_steps": 1,
-            # These should still be allowed:
             "training.lr": 1e-4,
             "training.weight_decay": 0.05,
             "cadence.ft_epochs": 60,
         },
     )
-    # Architecture fields untouched on cfg
-    assert cfg.training.depth == 28
-    assert cfg.training.embed_dim == 1408
-    assert cfg.training.num_heads == 22
-    assert cfg.training.patch_size == 16
-    assert cfg.training.batch_size == 1
-    assert cfg.training.bf16 is True
-    assert cfg.training.gradient_checkpointing is True
-    assert cfg.training.use_8bit_adam is True
-    assert cfg.training.gradient_accumulation_steps == 4
-    # Non-architecture changes did apply
-    assert "training.lr" in applied
-    assert "training.weight_decay" in applied
-    assert "cadence.ft_epochs" in applied
-    # Architecture changes are NOT in the applied dict (silently dropped)
-    assert "training.depth" not in applied
-    assert "training.embed_dim" not in applied
-    assert "training.batch_size" not in applied
-    assert "training.bf16" not in applied
+    assert cfg.training.depth == 16
+    assert cfg.training.embed_dim == 512
+    assert cfg.training.num_heads == 16
+    assert cfg.training.patch_size == 8
+    assert cfg.training.batch_size == 4
+    assert cfg.training.bf16 is False
+    assert cfg.training.gradient_checkpointing is False
+    assert cfg.training.use_8bit_adam is False
+    assert cfg.training.gradient_accumulation_steps == 1
+    for key in (
+        "training.depth", "training.embed_dim", "training.num_heads",
+        "training.patch_size", "training.batch_size",
+        "training.bf16", "training.gradient_checkpointing",
+        "training.use_8bit_adam", "training.gradient_accumulation_steps",
+        "training.lr", "training.weight_decay", "cadence.ft_epochs",
+    ):
+        assert key in applied, f"missing {key}"
 
 
 # ---------------------------------------------------- apply_curriculum_overrides
@@ -274,11 +306,15 @@ def test_resolve_next_state_idle_requires_description():
 
 
 class _FakeRegistry:
-    def __init__(self, history=None):
+    def __init__(self, history=None, wide_verify_history=None):
         self._history = history or []
+        self._wv_history = wide_verify_history or []
 
     def locked_val_history(self):
         return list(self._history)
+
+    def wide_verify_history(self):
+        return list(self._wv_history)
 
     def episodes_collected(self):
         return 40
@@ -325,6 +361,10 @@ def _cfg_for_snapshot(tmp_path: Path):
 
 def test_snapshot_run_context_has_all_keys(tmp_path):
     cfg = _cfg_for_snapshot(tmp_path)
+    # Repo default is now lifelong_mode=True, which restructures the
+    # snapshot (drops `goal.current_locked_val_mse`, etc.). This test
+    # asserts the legacy shape, so opt back to legacy explicitly.
+    cfg.cadence.lifelong_mode = False
     knobs = RuntimeKnobs.from_cfg(cfg)
 
     events_path = Path(cfg.paths.runs_dir) / "events_test.jsonl"
@@ -391,6 +431,59 @@ def test_build_think_prompt_contains_goal_and_schema():
     assert "runtime_overrides" in prompt
     assert "training_overrides" in prompt
     assert "curriculum_overrides" in prompt
+
+
+def test_snapshot_includes_scene_change_history(tmp_path):
+    cfg = _cfg_for_snapshot(tmp_path)
+    knobs = RuntimeKnobs.from_cfg(cfg)
+
+    events_path = Path(cfg.paths.runs_dir) / "events_test.jsonl"
+    # Two requests, one acked. Total = 2 requested, 1 acknowledged,
+    # pending=True because the second request has no matching ack.
+    with events_path.open("w") as f:
+        f.write(json.dumps({
+            "t": 100.0, "event": "claude_scene_change_requested",
+            "cycle": 1, "description": "move red block 5cm right",
+        }) + "\n")
+        f.write(json.dumps({
+            "t": 110.0, "event": "scene_ready_acknowledged", "cycle": 1,
+        }) + "\n")
+        f.write(json.dumps({
+            "t": 200.0, "event": "claude_scene_change_requested",
+            "cycle": 4, "description": "rotate cup 90 degrees",
+        }) + "\n")
+
+    registry = _FakeRegistry(history=[])
+    ctx = claude_advisor.snapshot_run_context(
+        events_path, registry, cfg, knobs, curriculum=None,
+        default_next_state="verify",
+    )
+    sch = ctx["scene_change_history"]
+    assert sch["total_requested"] == 2
+    assert sch["total_acknowledged"] == 1
+    assert sch["pending"] is True
+    assert len(sch["recent"]) == 2
+    assert sch["recent"][0]["description"] == "move red block 5cm right"
+    assert sch["recent"][0]["acknowledged_at"] == 110.0
+    assert sch["recent"][1]["description"] == "rotate cup 90 degrees"
+    assert sch["recent"][1]["acknowledged_at"] is None
+
+
+def test_prompt_explains_scene_change_budget():
+    ctx = {
+        "goal": {"arm_a_locked_val_mse": 0.0375, "current_locked_val_mse": 0.05},
+        "default_next_state": "verify",
+        "scene_change_history": {
+            "total_requested": 3, "total_acknowledged": 3,
+            "pending": False, "recent": [],
+        },
+    }
+    prompt = claude_advisor.build_think_prompt(ctx)
+    # The prompt must explain that scene changes are advisor-gated and
+    # surface the running count to the advisor's reasoning.
+    assert "Scene-change budget" in prompt
+    assert "scene_change_history" in prompt
+    assert "total_requested" in prompt
 
 
 # ---------------------------------------------------- run_advisor (real subprocess)
@@ -561,3 +654,188 @@ def test_build_think_prompt_contains_hardware_section_and_new_items():
     assert "training_stalled" in prompt
     assert "recent_gpu_signals" in prompt
     assert "recent_advisor_decisions" in prompt
+
+
+# ----------------------------------------------- lifelong-mode behavior
+
+
+def _cfg_lifelong(tmp_path: Path):
+    cfg = _cfg_for_snapshot(tmp_path)
+    cfg.cadence.lifelong_mode = True
+    return cfg
+
+
+def test_snapshot_lifelong_drops_locked_val_from_goal(tmp_path):
+    cfg = _cfg_lifelong(tmp_path)
+    knobs = RuntimeKnobs.from_cfg(cfg)
+    events_path = Path(cfg.paths.runs_dir) / "events_test.jsonl"
+    events_path.touch()
+    registry = _FakeRegistry(history=[
+        {"cycle": 0, "locked_val_mse": 0.12, "accepted": True},
+        {"cycle": 1, "locked_val_mse": 0.10, "accepted": True},
+    ])
+    ctx = claude_advisor.snapshot_run_context(
+        events_path, registry, cfg, knobs, curriculum=None,
+    )
+    # Goal must NOT carry the locked-val numeric target.
+    assert ctx["goal"]["mode"] == "lifelong"
+    assert "current_locked_val_mse" not in ctx["goal"]
+    assert "arm_a_locked_val_mse" not in ctx["goal"]
+    # Locked-val moves to auxiliary so the advisor can still tiebreak with it.
+    assert "auxiliary" in ctx
+    assert ctx["auxiliary"]["current_locked_val_mse"] == 0.10
+    assert len(ctx["auxiliary"]["locked_val_history"]) == 2
+    # Top-level locked_val_history is dropped in lifelong mode.
+    assert "locked_val_history" not in ctx
+    # plateau_signal is always present.
+    assert "plateau_signal" in ctx
+    assert "verdict" in ctx["plateau_signal"]
+
+
+def test_snapshot_legacy_keeps_locked_val_in_goal(tmp_path):
+    cfg = _cfg_for_snapshot(tmp_path)
+    # Repo default is now lifelong_mode=True; opt back to legacy here so
+    # this test continues to verify the legacy snapshot shape.
+    cfg.cadence.lifelong_mode = False
+    knobs = RuntimeKnobs.from_cfg(cfg)
+    events_path = Path(cfg.paths.runs_dir) / "events_test.jsonl"
+    events_path.touch()
+    registry = _FakeRegistry(history=[
+        {"cycle": 0, "locked_val_mse": 0.10, "accepted": True},
+    ])
+    ctx = claude_advisor.snapshot_run_context(
+        events_path, registry, cfg, knobs, curriculum=None,
+    )
+    # Legacy shape: locked-val drives the goal.
+    assert "current_locked_val_mse" in ctx["goal"]
+    assert ctx["goal"]["current_locked_val_mse"] == 0.10
+    assert "arm_a_locked_val_mse" in ctx["goal"]
+    assert "locked_val_history" in ctx
+    assert "auxiliary" not in ctx
+
+
+def test_lifelong_prompt_uses_lifelong_goal_block():
+    ctx = {
+        "goal": {"mode": "lifelong", "tau_low": 0.005, "tau_high": 0.008},
+        "default_next_state": "verify",
+        "plateau_signal": {"verdict": "improving"},
+        "auxiliary": {"current_locked_val_mse": 0.09},
+    }
+    prompt = claude_advisor.build_think_prompt(ctx)
+    # Lifelong-mode framing tokens.
+    assert "lifelong mode" in prompt
+    assert "lifelong-learning loop" in prompt
+    assert "no automatic termination" in prompt
+    assert "Plateau handling" in prompt
+    assert "plateau_low_locked_val" in prompt
+    assert "plateau_high_locked_val" in prompt
+    # Tau values surfaced in the goal block.
+    assert "0.005" in prompt
+    assert "0.008" in prompt
+    # Legacy "Arm A reference" framing must be absent FROM THE GOAL
+    # BLOCK at the top of the prompt. (The body's "what to think about"
+    # section may still mention locked_val_mse as a diagnostic; that's
+    # a future cleanup, not a regression.)
+    head = prompt.split("## System constraints", 1)[0]
+    assert "Arm A" not in head
+    assert "arm_a_locked_val_mse" not in head
+    # System constraints body still present.
+    assert "RTX 5090" in prompt
+
+
+def test_legacy_prompt_keeps_arm_a_framing():
+    ctx = {
+        "goal": {"arm_a_locked_val_mse": 0.0375, "current_locked_val_mse": 0.05},
+        "default_next_state": "verify",
+    }
+    prompt = claude_advisor.build_think_prompt(ctx)
+    assert "arm_a_locked_val_mse" in prompt
+    assert "0.0375" in prompt
+    # The lifelong-mode goal block (which talks about "lifelong-learning
+    # loop" / "Plateau handling") is NOT used in legacy mode. The body
+    # may still reference "lifelong mode" briefly to clarify mode-aware
+    # signal semantics — that's fine; assert against the unique tokens
+    # of the lifelong goal-block prefix instead.
+    assert "lifelong-learning loop" not in prompt
+    assert "## Plateau handling" not in prompt
+
+
+def test_snapshot_includes_wide_verify_history(tmp_path):
+    cfg = _cfg_lifelong(tmp_path)
+    knobs = RuntimeKnobs.from_cfg(cfg)
+    events_path = Path(cfg.paths.runs_dir) / "events_test.jsonl"
+    events_path.touch()
+    wv_history = [
+        {"path": "/x/burst_0", "n_probes": 12, "scenes": 3, "cycle": 1, "t": "x"},
+        {"path": "/x/burst_1", "n_probes": 12, "scenes": 3, "cycle": 4, "t": "x"},
+    ]
+    registry = _FakeRegistry(history=[], wide_verify_history=wv_history)
+    ctx = claude_advisor.snapshot_run_context(
+        events_path, registry, cfg, knobs, curriculum=None,
+    )
+    assert "wide_verify" in ctx
+    assert ctx["wide_verify"]["corpus_size"] == 2
+    assert len(ctx["wide_verify"]["history"]) == 2
+    assert ctx["wide_verify"]["history"][1]["cycle"] == 4
+
+
+def test_prompt_explains_scene_overfit_trigger():
+    """The prompt must teach the advisor to map 'best_val improving while
+    VERIFY mean_err regressing' to `idle`, not to `explore`. Without
+    this, the advisor keeps collecting more poses against an unchanging
+    scene and the model entrenches its memorization (observed regression
+    behavior in pan_only_1b run cycles 5-7)."""
+    prompt = claude_advisor.build_think_prompt({
+        "goal": {"mode": "lifelong", "tau_low": 0.005, "tau_high": 0.008},
+        "default_next_state": "verify",
+    })
+    # Concrete numerical trigger present.
+    assert "5×" in prompt or "5x" in prompt.lower()
+    assert "memoriz" in prompt.lower()
+    # Distinguishes pose-bound from scene-bound.
+    assert "POSE-bound" in prompt or "pose-bound" in prompt.lower()
+    assert "SCENE-bound" in prompt or "scene-bound" in prompt.lower()
+    # Concrete instruction to route to idle (not explore) on the
+    # overfit-to-scene case.
+    assert "scene_change_description" in prompt
+    # The "high novelty doesn't rescue you" warning is present so the
+    # advisor doesn't dismiss the trigger when novelty is high.
+    assert "novelty" in prompt.lower()
+
+
+def test_lifelong_prompt_explains_wide_verify_lever():
+    ctx = {
+        "goal": {"mode": "lifelong", "tau_low": 0.005, "tau_high": 0.008},
+        "default_next_state": "verify",
+        "plateau_signal": {"verdict": "stuck"},
+        "wide_verify": {"corpus_size": 0, "history": []},
+    }
+    prompt = claude_advisor.build_think_prompt(ctx)
+    # The lifelong prompt must teach the advisor about wide_verify_next
+    # and `wide_verify_mse` as the primary generalization signal.
+    assert "wide_verify_next" in prompt
+    assert "wide_verify_mse" in prompt
+    assert "wide_verify.corpus_size" in prompt
+    # And it must be present in the JSON-schema example so the advisor
+    # actually knows it can return this field.
+    head = prompt.split("## What to think about", 1)[0]
+    assert "wide_verify_next" in head
+
+
+def test_prompt_body_uses_mode_aware_primary_signal_terminology():
+    # Body references should be mode-agnostic so the same body text
+    # works under either goal-block prefix.
+    legacy = claude_advisor.build_think_prompt({
+        "goal": {"arm_a_locked_val_mse": 0.0375, "current_locked_val_mse": 0.05},
+        "default_next_state": "verify",
+    })
+    lifelong = claude_advisor.build_think_prompt({
+        "goal": {"mode": "lifelong", "tau_low": 0.005, "tau_high": 0.008},
+        "default_next_state": "verify",
+    })
+    # Both must mention the mode-aware signal terminology so the advisor
+    # interprets the same body correctly under each mode.
+    for prompt in (legacy, lifelong):
+        assert "primary quality signal" in prompt
+        assert "recent_verifies" in prompt
+        assert "plateau_signal" in prompt

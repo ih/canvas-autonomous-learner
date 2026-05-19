@@ -1,0 +1,188 @@
+# pan_only_1b — fresh 1B cold-start, shoulder_pan SOLE policy joint.
+#
+# Experiment goal: train a 1B world model from scratch where shoulder_pan
+# is the only joint that ever moves during EXPLORE recording, the only
+# joint VERIFY probes evaluate, and the only joint canvas-robot-control
+# will plan over at deployment. No elbow_flex anywhere — that capacity
+# would be wasted on dynamics the closed-loop controller never queries.
+#
+# Differences from pan_focus_1b:
+#   - explore.joints removed; vary_target_joint=false; only shoulder_pan
+#     episodes are recorded.
+#   - locked_val_elbow path is null (script + trainer auto-skip elbow eval).
+#   - cadence.lifelong_mode=true. Decisions route on the rolling VERIFY
+#     mean_err + train/val curves + novelty reports, NOT on
+#     locked_val_mse. Locked-val is still computed (for human inspection)
+#     but is downgraded to auxiliary context in the advisor's snapshot.
+#     There is no auto-termination on plateau; instead, plateau is a
+#     signal the thinker uses to route to explore / idle.
+#
+# Architecture: depth=28 / embed_dim=1408 / num_heads=22 → ~1.02B params.
+# Training mechanics required to fit on a 32GB 5090:
+#   - bf16 mixed precision (forward/backward in bf16, master weights fp32)
+#   - gradient checkpointing on every transformer block
+#   - bitsandbytes AdamW8bit optimizer state
+#   - batch_size=1 with gradient_accumulation_steps=4 (effective batch=4)
+#
+# Cold-start: live_checkpoint is null and runs/pan_only_1b/ does not
+# exist on the first launch, so the orchestrator's cycle 0 takes the
+# from-scratch path with `cold_start_epochs`.
+#
+# To launch:
+#   python -m learner --config configs/pan_only_1b.yaml
+#
+# Best checkpoint will appear in the live dashboard as
+# "best pan_only_1b (val_mse=...)" once at least one RETRAIN succeeds.
+
+paths:
+  canvas_world_model: ../canvas-world-model
+  canvas_robot_control: ../canvas-robot-control
+  robotic_foundation_model_tests: ../robotic-foundation-model-tests
+  base_canvas: null
+  val_dataset: null
+  locked_val_shoulder: ./datasets/locked_val_pan_only/shoulder
+  # No elbow locked-val for this experiment — see header comment.
+  locked_val_elbow: null
+  locked_val_dataset: ./datasets/locked_val_pan_only/shoulder
+  live_checkpoint: null
+  ckpt_dir: ./runs/pan_only_1b/checkpoints
+  canvas_out: ./runs/pan_only_1b/canvas
+  lerobot_out: ./runs/pan_only_1b/lerobot
+  runs_dir: ./runs/pan_only_1b
+  registry_file: ./runs/pan_only_1b/registry.json
+  python: C:/Projects/pythonenv-lerobot/Scripts/python.exe
+
+robot:
+  port: COM3
+  robot_id: my_so101_follower
+  control_joint: shoulder_pan
+  step_size: 10.0
+  joint_min: -60.0
+  joint_max: 60.0
+  base_camera: 1
+  wrist_camera: 0
+  camera_width: 640
+  camera_height: 480
+  camera_fps: 10
+  home:
+    shoulder_pan: 21.07
+    shoulder_lift: -100.00
+    elbow_flex: 94.92
+    wrist_flex: 31.82
+    wrist_roll: 5.12
+    gripper: 10.13
+
+thresholds:
+  tau_low: 0.005
+  tau_high: 0.008
+  # In lifelong_mode the val_guard guards against a regression in the
+  # trainer's INTERNAL train/val split (best_val_loss ratio vs recent
+  # median), not against locked_val. Looser since the internal val is
+  # noisier than locked-val.
+  val_guard: 1.5
+  max_consecutive_rejections: 3
+
+cadence:
+  idle_seconds: 0
+  # Lifelong learner: routing is driven by collected-data signals
+  # (rolling VERIFY mean_err, train/val curves, novelty reports). The
+  # locked-val set, when present, is computed for human inspection only
+  # and is surfaced to the advisor as auxiliary context (tiebreaker for
+  # ambiguous plateaus), not as the optimization target. Plateau is a
+  # diagnostic signal — never an auto-termination trigger.
+  lifelong_mode: true
+  claude_advisor_enabled: true
+  claude_max_consecutive_retrains: 5
+  claude_advisor_crash_timeout_s: 1800
+  claude_advisor_model: opus
+  claude_advisor_effort: max
+  per_joint_targeting: true
+  probes_per_verify: 6
+  window_size: 24
+  settle_time: 0.5
+  base_explore_batch_size: 40
+  explore_batch_size_min: 20
+  explore_batch_size_max: 240
+  max_sub_bursts: 8
+  min_sub_burst_size: 20
+  cold_start_epochs: 30
+  ft_epochs: 20
+  early_stop_patience: 6
+  safety_cap_episodes: 3000
+  warmup_cycles: 2
+  explore_max_retries: 2
+  explore_retry_backoff: 10.0
+  training_stall_timeout_s: 1800
+  retrain_timeout_s: 14400      # 4h ceiling for any single retrain at 1B
+
+gpu:
+  # See pan_focus_1b.yaml for rationale: 0.95 is enforced inside the
+  # trainer via --gpu-mem-fraction (forces clean OOM at the cap); 0.96
+  # here is the nvidia-smi-driven backstop for non-allocator paths.
+  memory_abort_frac: 0.96
+  memory_warn_frac: 0.93
+  sample_interval_s: 5.0
+
+range:
+  enabled: false
+
+training:
+  patch_size: 16
+  embed_dim: 1408
+  depth: 28
+  num_heads: 22
+
+  bf16: true
+  gradient_checkpointing: true
+  use_8bit_adam: true
+  batch_size: 1
+  gradient_accumulation_steps: 4
+
+  num_train_timesteps: 1000
+  beta_schedule: cosine
+  prediction_type: sample
+
+  lr: 3.0e-4
+  weight_decay: 0.01
+  lr_schedule: cosine
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+  seed: 42
+  val_ratio: 0.1
+
+  motor_bounds:
+    motor_norm_min: [-100.0, -100.0, -100.0, -100.0, -100.0, -100.0]
+    motor_norm_max: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
+
+actions:
+  candidates: [1, 2, 3]
+  probe_weights: null
+
+explore:
+  # Single-joint exploration. shoulder_pan is the only joint the recorder
+  # ever moves; the policy_joint_name + `vary_target_joint: false` combo
+  # pins every recorded episode to shoulder_pan.pos. No elbow_flex pool
+  # entry — that diversity argument is replaced by scene-change requests
+  # from the advisor (cf. cadence.lifelong_mode behavior).
+  vary_target_joint: false
+  joint_ranges:
+    shoulder_pan.pos: [-60.0, 60.0]
+  policy_joint_name: shoulder_pan.pos
+  action_duration: 1.0
+  start_buffer: 2.5
+  dataset_fps: 10
+  base_camera_name: base_0_rgb
+  wrist_camera_name: left_wrist_0_rgb
+  repo_id_prefix: pan_only_1b/autonomous-explore
+  inactive_joint_positions:
+    shoulder_lift: -100.00
+    elbow_flex: 94.92
+    wrist_flex: 31.82
+    wrist_roll: 5.12
+    gripper: 10.13
+
+verify:
+  repo_id_prefix: pan_only_1b/autonomous-verify
+
+dry_run: false

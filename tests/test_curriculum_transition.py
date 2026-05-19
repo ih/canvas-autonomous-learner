@@ -157,7 +157,7 @@ def _stub_trio(tmp_path: Path, probe_iter, retrain_results):
         return Path(output_dir)
 
     def fake_retrain(cfg_, accumulated_canvas_dirs, resume_checkpoint, epochs,
-                      locked_val_dataset=None, event_log=None):
+                      locked_val_dataset=None, event_log=None, **kwargs):
         retrain_calls.append({"resume": resume_checkpoint, "epochs": epochs})
         try:
             return next(results)

@@ -26,8 +26,13 @@ def dynamic_explore_batch_size(
     - `mean_err is None` → `hi` (cold start or just after a range expansion;
       we have no signal to thresh on, so collect the maximum).
     - `mean_err <= tau_high` → `base` (clamped to `[lo, hi]`).
-    - `mean_err >= 3 × tau_high` → `3 × base` (clamped to `[lo, hi]`).
+    - `mean_err >= 8 × tau_high` → `8 × base` (clamped to `[lo, hi]`).
     - In between: linear scaling `base * (mean_err / tau_high)`.
+
+    The 8× ceiling (was 3×) lets a sustained "data-bound" diagnosis
+    actually translate into a much-larger explore burst when the
+    user-tunable `hi` is generous, rather than being throttled by an
+    internal compute-budget heuristic from before the advisor existed.
 
     The final result is always an integer clamped to `[lo, hi]`.
     """
@@ -36,5 +41,5 @@ def dynamic_explore_batch_size(
     # Degenerate: tau_high very small or zero → treat as "always bad".
     if tau_high <= 0:
         return int(max(lo, min(hi, hi)))
-    scale = max(1.0, min(3.0, mean_err / tau_high))
+    scale = max(1.0, min(8.0, mean_err / tau_high))
     return int(max(lo, min(hi, base * scale)))

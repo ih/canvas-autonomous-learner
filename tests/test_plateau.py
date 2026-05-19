@@ -1,6 +1,6 @@
 """Unit tests for the plateau detector."""
 
-from learner.plateau import plateau_reached
+from learner.plateau import plateau_reached, plateau_summary
 
 
 def _h(cycle, mse, accepted=True):
@@ -81,3 +81,55 @@ def test_custom_threshold():
     assert plateau_reached(history, threshold=0.75) is True
     # With default 0.95 → not plateau
     assert plateau_reached(history) is False
+
+
+# --------------------------------------------------- plateau_summary
+
+
+def _v(mean_err: float) -> dict:
+    return {"event": "verify_summary", "mean_err": mean_err}
+
+
+def test_summary_insufficient_data():
+    s = plateau_summary([], verify_history=[])
+    assert s["verdict"] == "insufficient_data"
+    assert s["locked_val_plateau"] is None
+    assert s["verify_plateau"] is None
+
+
+def test_summary_improving_when_verify_still_moving():
+    # Verify mean_err is dropping cleanly — model is still improving.
+    s = plateau_summary(
+        [_h(i, 0.10 - i * 0.01) for i in range(6)],
+        verify_history=[_v(0.10), _v(0.07), _v(0.04)],
+    )
+    assert s["verdict"] == "improving"
+    assert s["verify_plateau"] is False
+
+
+def test_summary_plateau_low_locked_val():
+    # Verify has plateaued AND locked-val is much lower than its
+    # earliest measurement (the "model has learned the scene" case).
+    locked = [_h(i, 0.10) for i in range(2)] + [
+        _h(i, 0.005) for i in range(2, 7)
+    ]
+    s = plateau_summary(locked, verify_history=[_v(0.005), _v(0.005), _v(0.005)])
+    assert s["verify_plateau"] is True
+    assert s["verdict"] == "plateau_low_locked_val"
+
+
+def test_summary_plateau_high_locked_val():
+    # Verify has plateaued but locked-val hasn't moved meaningfully —
+    # model is stuck on the current data; needs new episodes / scene.
+    locked = [_h(i, 0.10) for i in range(7)]
+    s = plateau_summary(locked, verify_history=[_v(0.09), _v(0.09), _v(0.09)])
+    assert s["verify_plateau"] is True
+    assert s["verdict"] == "plateau_high_locked_val"
+
+
+def test_summary_stuck_when_verify_plateau_no_locked_val():
+    # Verify has plateaued, no locked-val to disambiguate — verdict=stuck
+    # so the advisor still has a clear cue to act.
+    s = plateau_summary([], verify_history=[_v(0.05), _v(0.05), _v(0.05)])
+    assert s["verify_plateau"] is True
+    assert s["verdict"] == "stuck"

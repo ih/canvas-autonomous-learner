@@ -56,6 +56,12 @@ cadence:
   # kept so older configs still parse. The new IDLE state is a human-
   # in-the-loop wait for a physical scene change and has no timeout.
   idle_seconds: 0
+  # Pin legacy mode for the A/B comparison so val_guard prefers
+  # locked_val (the Arm A reference) and the advisor's goal is to drive
+  # locked_val below the offline baseline. The repo-wide default is
+  # lifelong_mode=true; this config opts out to preserve comparison
+  # semantics.
+  lifelong_mode: false
   claude_advisor_enabled: true
   claude_max_consecutive_retrains: 5
   claude_advisor_crash_timeout_s: 1800

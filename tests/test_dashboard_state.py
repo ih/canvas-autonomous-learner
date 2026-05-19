@@ -27,7 +27,14 @@ def _write_events(runs_dir: Path, session: str, events: list[dict]) -> None:
 
 def test_empty_runs_returns_null_session(tmp_path):
     payload = dashboard.build_state_payload(tmp_path)
-    assert payload == {"session": None, "probes": [], "events": []}
+    # `experiment` is the runs_dir basename — present even pre-session
+    # so the dashboard header pill can render before any events land.
+    assert payload == {
+        "session": None,
+        "experiment": tmp_path.name,
+        "probes": [],
+        "events": [],
+    }
 
 
 def test_payload_has_new_top_level_fields(tmp_path):

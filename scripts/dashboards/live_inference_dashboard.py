@@ -66,13 +66,250 @@ class DashboardState:
     before_ts: Optional[float] = None
     torque_on: bool = True
     canvas_tokens: dict = field(default_factory=dict)  # token -> Path
-    active_model: str = "learner"  # "learner" or "baseline"
+    active_model: str = ""  # option key from `_build_model_options`
     active_checkpoint: Optional[str] = None  # path of currently loaded model
 
     def clear_before(self) -> None:
         self.before_motor = None
         self.before_ctx = None
         self.before_ts = None
+
+
+# ----------------------------------------------------------- model options ---
+
+
+def _best_from_registry(reg_path: Path) -> Optional[dict]:
+    """Lowest-val-mse history entry from a learner registry, if any.
+
+    Returns {'path', 'val_mse', 'session'} or None.
+    """
+    try:
+        data = json.loads(reg_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    history = data.get("history") or []
+    cands = [
+        e for e in history
+        if isinstance(e.get("val_mse"), (int, float))
+        and e.get("new") and Path(e["new"]).exists()
+    ]
+    if not cands:
+        return None
+    best = min(cands, key=lambda e: e["val_mse"])
+    return {
+        "path": str(Path(best["new"]).resolve()),
+        "val_mse": float(best["val_mse"]),
+        "session": reg_path.parent.name,
+    }
+
+
+def _best_from_cold_warm_compare(cwc_path: Path) -> Optional[dict]:
+    """Best cold-start checkpoint from a cold_warm_compare.json file.
+
+    Picks the entry with the lowest `cold_train_val_mse` whose
+    `cold_checkpoint` file still exists on disk. Returns {'path',
+    'val_mse', 'locked_val_mse', 'wide_verify_mse', 'scene_count',
+    'session'} or None.
+    """
+    try:
+        data = json.loads(cwc_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, list):
+        return None
+    cands = [
+        e for e in data
+        if isinstance(e.get("cold_train_val_mse"), (int, float))
+        and e.get("cold_checkpoint") and Path(e["cold_checkpoint"]).exists()
+    ]
+    if not cands:
+        return None
+    best = min(cands, key=lambda e: e["cold_train_val_mse"])
+    return {
+        "path": str(Path(best["cold_checkpoint"]).resolve()),
+        "val_mse": float(best["cold_train_val_mse"]),
+        "locked_val_mse": best.get("cold_locked_val_mse"),
+        "wide_verify_mse": best.get("cold_wide_verify_mse"),
+        "scene_count": int(best.get("scene_count", 0)),
+        "session": cwc_path.parent.name,
+    }
+
+
+def _build_model_options(
+    cfg,
+    registry: "Registry",
+    repo_root: Path,
+    extra_baseline: Optional[str] = None,
+) -> list[dict]:
+    """Build the list of selectable model options.
+
+    Re-evaluated each request so newly-promoted learner checkpoints show up
+    immediately. Each entry: {key, label, path, note}. Entries whose
+    underlying file is missing are skipped.
+    """
+    opts: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(key: str, label: str, path: Optional[str], note: str) -> None:
+        if not path:
+            return
+        resolved = str(Path(path).resolve())
+        if not Path(resolved).exists():
+            return
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        opts.append({"key": key, "label": label, "path": resolved, "note": note})
+
+    cwm_root = getattr(cfg.paths, "canvas_world_model", None)
+    if cwm_root:
+        diff4 = (Path(cwm_root) / "local" / "checkpoints"
+                 / "diff_iter4_wider" / "best.pth")
+        _add(
+            "diff_iter4",
+            "diff_iter4 (canvas-world-model baseline)",
+            str(diff4) if diff4.exists() else None,
+            f"600M-class baseline checkpoint: {diff4}",
+        )
+
+    # Best 1B: lowest val_mse in runs/sim_1b/registry.json history.
+    sim_1b_reg = repo_root / "runs" / "sim_1b" / "registry.json"
+    if sim_1b_reg.exists():
+        b = _best_from_registry(sim_1b_reg)
+        if b is not None:
+            _add(
+                "best_1b",
+                f"best 1B (sim_1b, val_mse={b['val_mse']:.5f})",
+                b["path"],
+                f"Lowest-val-mse entry from runs/sim_1b/registry.json: "
+                f"{b['path']}",
+            )
+
+    # Best pan_focus_1b: shoulder_pan-only policy, 1B cold-start.
+    pan_focus_reg = repo_root / "runs" / "pan_focus_1b" / "registry.json"
+    if pan_focus_reg.exists():
+        b = _best_from_registry(pan_focus_reg)
+        if b is not None:
+            _add(
+                "best_pan_focus_1b",
+                f"best pan_focus_1b (val_mse={b['val_mse']:.5f})",
+                b["path"],
+                f"Lowest-val-mse entry from runs/pan_focus_1b/registry.json: "
+                f"{b['path']}",
+            )
+
+    # Best pan_only_1b: lifelong-mode shoulder-only experiment. Note —
+    # locked_val_mse here is auxiliary (not the routing target), so the
+    # "best" picked is still the lowest-val_mse checkpoint in registry
+    # history; that's the natural pick for the live-inference dashboard
+    # which is itself a quality assessment tool, not a routing decision.
+    pan_only_reg = repo_root / "runs" / "pan_only_1b" / "registry.json"
+    if pan_only_reg.exists():
+        b = _best_from_registry(pan_only_reg)
+        if b is not None:
+            _add(
+                "best_pan_only_1b",
+                f"best pan_only_1b (val_mse={b['val_mse']:.5f})",
+                b["path"],
+                f"Lowest-val-mse entry from runs/pan_only_1b/registry.json: "
+                f"{b['path']}",
+            )
+
+    # Best 1B from red_kong_1b — the actual hardware experiment that
+    # plateaued at locked_val ~0.011, train_val ~0.0008. This is the
+    # 1B reference for visual-quality comparison against the 250M.
+    red_kong_1b_reg = repo_root / "runs" / "red_kong_1b" / "registry.json"
+    if red_kong_1b_reg.exists():
+        b = _best_from_registry(red_kong_1b_reg)
+        if b is not None:
+            _add(
+                "best_red_kong_1b",
+                f"best 1B (red_kong_1b, val_mse={b['val_mse']:.5f})",
+                b["path"],
+                f"Lowest-val-mse entry from runs/red_kong_1b/registry.json: "
+                f"{b['path']}",
+            )
+
+    # Best 250M from red_kong_min_data_250m — warm-trajectory best
+    # (the live-checkpoint path the orchestrator promoted with the
+    # lowest train_val_mse over the 15-cycle min-data sweep).
+    rk250_reg = repo_root / "runs" / "red_kong_min_data_250m" / "registry.json"
+    if rk250_reg.exists():
+        b = _best_from_registry(rk250_reg)
+        if b is not None:
+            _add(
+                "best_red_kong_min_data_250m",
+                f"best 250M warm (red_kong_min_data_250m, val_mse={b['val_mse']:.5f})",
+                b["path"],
+                f"Lowest-val-mse entry from runs/red_kong_min_data_250m/"
+                f"registry.json (warm fine-tune trajectory): {b['path']}",
+            )
+
+    # Best 250M cold-start from cold_warm_compare.json — the
+    # retrospective cold-only sweep. Often beats the warm trajectory
+    # at high scene counts (~10% lower locked_val + wide_verify in
+    # the 2026-05-05 run).
+    cwc_path = (
+        repo_root / "runs" / "red_kong_min_data_250m" / "cold_warm_compare.json"
+    )
+    if cwc_path.exists():
+        bc = _best_from_cold_warm_compare(cwc_path)
+        if bc is not None:
+            wv = bc.get("wide_verify_mse")
+            lv = bc.get("locked_val_mse")
+            stats = f"val_mse={bc['val_mse']:.5f}"
+            if lv is not None:
+                stats += f", locked_val={lv:.5f}"
+            if wv is not None:
+                stats += f", wide_verify={wv:.5f}"
+            _add(
+                "best_red_kong_min_data_250m_cold",
+                f"best 250M cold (scene {bc['scene_count']}, {stats})",
+                bc["path"],
+                f"Lowest cold_train_val_mse in runs/red_kong_min_data_250m/"
+                f"cold_warm_compare.json (scene_count={bc['scene_count']}): "
+                f"{bc['path']}",
+            )
+
+    # Best across ALL autonomous-learner registries (sim, sim_1b, sim_smoke, ...).
+    best_learner: Optional[dict] = None
+    for reg in (repo_root / "runs").glob("*/registry.json"):
+        b = _best_from_registry(reg)
+        if b is None:
+            continue
+        if best_learner is None or b["val_mse"] < best_learner["val_mse"]:
+            best_learner = b
+    if best_learner is not None:
+        _add(
+            "best_learner",
+            f"best autonomous-learner ({best_learner['session']}, "
+            f"val_mse={best_learner['val_mse']:.5f})",
+            best_learner["path"],
+            f"Lowest-val-mse across runs/*/registry.json: "
+            f"{best_learner['path']}",
+        )
+
+    # Currently-promoted live checkpoint from the configured registry —
+    # only added if it isn't already present under one of the keys above.
+    live = registry.live_checkpoint()
+    if live:
+        _add(
+            "live",
+            f"live (current registry: {Path(cfg.paths.registry_file).parent.name})",
+            live,
+            f"registry.live_checkpoint() from {cfg.paths.registry_file}: {live}",
+        )
+
+    if extra_baseline:
+        _add(
+            "extra_baseline",
+            f"extra ({Path(extra_baseline).parent.name}/"
+            f"{Path(extra_baseline).name})",
+            extra_baseline,
+            f"--baseline-checkpoint: {extra_baseline}",
+        )
+
+    return opts
 
 
 # ------------------------------------------------------------- canvas ops ---
@@ -211,29 +448,25 @@ def make_handler(
     joints: list[str],
     mode: str,
     baseline_checkpoint: Optional[str],
+    repo_root: Path,
 ):
     from control.robot_interface import JOINTS  # type: ignore
 
-    def _learner_ckpt() -> str:
-        """Always read fresh from the registry — the autonomous learner
-        may swap this mid-session."""
-        ckpt = registry.live_checkpoint() or ""
-        return ckpt
+    def _options() -> list[dict]:
+        return _build_model_options(cfg, registry, repo_root, baseline_checkpoint)
 
-    initial_learner_ckpt = _learner_ckpt()
-    has_baseline = bool(baseline_checkpoint) and Path(baseline_checkpoint).exists()
+    def _render_index() -> bytes:
+        return (
+            INDEX_HTML
+            .replace("__JOINTS__", json.dumps(joints))
+            .replace("__CONTROL_JOINT__", cfg.robot.control_joint)
+            .replace("__MODE__", mode)
+            .replace("__MODEL_OPTIONS__", json.dumps(_options()))
+            .replace("__INITIAL_MODEL_KEY__", state.active_model)
+            .replace("__INITIAL_MODEL_CKPT__", state.active_checkpoint or "")
+            .encode("utf-8")
+        )
 
-    index_html = (
-        INDEX_HTML
-        .replace("__JOINTS__", json.dumps(joints))
-        .replace("__CONTROL_JOINT__", cfg.robot.control_joint)
-        .replace("__MODE__", mode)
-        .replace("__LEARNER_CKPT__", initial_learner_ckpt)
-        .replace("__BASELINE_CKPT__", baseline_checkpoint or "")
-        .replace("__HAS_BASELINE__", "true" if has_baseline else "false")
-        .replace("__INITIAL_MODEL__", state.active_model)
-        .encode("utf-8")
-    )
     canvas_out_resolved = canvas_out_dir.resolve()
 
     def _mint_token(path: Path) -> str:
@@ -304,7 +537,7 @@ def make_handler(
         def do_GET(self):
             path = self.path.split("?", 1)[0]
             if path in ("/", "/index.html"):
-                self._send_bytes(200, index_html, "text/html; charset=utf-8")
+                self._send_bytes(200, _render_index(), "text/html; charset=utf-8")
                 return
             if path.startswith("/canvas/"):
                 token = unquote(path[len("/canvas/"):])
@@ -372,29 +605,25 @@ def make_handler(
             return action
 
         def _api_set_model(self, body: dict) -> dict:
-            choice = str(body.get("model") or "").strip()
-            if choice not in ("learner", "baseline"):
-                raise ValueError(f"model must be 'learner' or 'baseline', got {choice!r}")
-            if choice == "baseline":
-                if not has_baseline:
-                    raise RuntimeError(
-                        "no baseline checkpoint configured — pass "
-                        "--baseline-checkpoint PATH on the dashboard CLI."
-                    )
-                target = baseline_checkpoint
-            else:
-                target = _learner_ckpt()
-                if not target or not Path(target).exists():
-                    raise RuntimeError(
-                        f"learner checkpoint from registry is missing: {target!r}"
-                    )
-            # Reload under the bus lock so no Predict/Execute is racing.
+            key = str(body.get("model") or "").strip()
+            if not key:
+                raise ValueError("missing 'model' key")
+            # Re-resolve at click time so "best_1b"/"best_learner"/"live"
+            # always reflect the latest registry state.
+            options = _options()
+            match = next((o for o in options if o["key"] == key), None)
+            if match is None:
+                available = ", ".join(o["key"] for o in options) or "(none)"
+                raise ValueError(
+                    f"unknown model {key!r}; available: {available}"
+                )
+            target = match["path"]
             with bus_lock:
-                print(f"[set_model] loading {choice}: {target}", flush=True)
+                print(f"[set_model] loading {key}: {target}", flush=True)
                 t0 = time.time()
                 hw.load_predictor(target)
                 elapsed = time.time() - t0
-                state.active_model = choice
+                state.active_model = key
                 state.active_checkpoint = target
                 # Any "before" captured for the previous model's prediction
                 # is still physically valid but no longer compares apples
@@ -404,6 +633,7 @@ def make_handler(
             return {
                 "active_model": state.active_model,
                 "active_checkpoint": state.active_checkpoint,
+                "active_label": match["label"],
                 "load_seconds": elapsed,
             }
 
@@ -576,8 +806,25 @@ def serve(cfg_path: Path, port: int, host: str, dry_run: bool,
 
     bus_lock = threading.Lock()
     state = DashboardState()
-    state.active_model = "learner"
-    state.active_checkpoint = ckpt
+    state.active_checkpoint = str(Path(ckpt).resolve())
+
+    # Pick the option key that matches whichever checkpoint we actually
+    # loaded at startup. Fall back to "live" so the dropdown still has
+    # something selected even if the loaded path doesn't match a curated
+    # entry (e.g. dashboard pointed at an ad-hoc registry).
+    initial_options = _build_model_options(
+        cfg, registry, REPO_ROOT, baseline_checkpoint
+    )
+    initial_key = next(
+        (o["key"] for o in initial_options
+         if o["path"] == state.active_checkpoint),
+        "live",
+    )
+    state.active_model = initial_key
+    print(f"  available models:")
+    for o in initial_options:
+        marker = "*" if o["key"] == initial_key else " "
+        print(f"   {marker} {o['key']}: {o['label']}")
 
     mode = "dry-run" if dry_run else "hardware"
     handler = make_handler(
@@ -585,6 +832,7 @@ def serve(cfg_path: Path, port: int, host: str, dry_run: bool,
         bus_lock=bus_lock, state=state,
         canvas_out_dir=canvas_out_dir, joints=joints, mode=mode,
         baseline_checkpoint=baseline_checkpoint,
+        repo_root=REPO_ROOT,
     )
 
     with _ThreadedServer((host, port), handler) as httpd:

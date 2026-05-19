@@ -71,6 +71,34 @@ class SubprocessTimeout(Exception):
         super().__init__(f"[{tag}] hard timeout after {self.timeout_s:.0f}s")
 
 
+class SubprocessThroughputCollapse(Exception):
+    """Raised when training is still ticking but per-epoch wall time has
+    collapsed vs. the warmup baseline. Catches the VRAM-spillover
+    failure mode where epochs continue but at 10-100x slower (so
+    SubprocessStalled never trips because lines DO arrive).
+    """
+
+    def __init__(
+        self,
+        tag: str,
+        recent_epoch_s: float,
+        baseline_epoch_s: float,
+        ratio: float,
+        summary: Optional[dict] = None,
+        last_lines: Optional[list[str]] = None,
+    ):
+        self.tag = tag
+        self.recent_epoch_s = float(recent_epoch_s)
+        self.baseline_epoch_s = float(baseline_epoch_s)
+        self.ratio = float(ratio)
+        self.summary = summary or {}
+        self.last_lines = last_lines or []
+        super().__init__(
+            f"[{tag}] throughput collapse: recent epoch {self.recent_epoch_s:.1f}s "
+            f"vs baseline {self.baseline_epoch_s:.1f}s ({self.ratio:.1f}x)"
+        )
+
+
 def _stamp() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
 
@@ -144,6 +172,8 @@ def _run(
     abort_frac: float = 0.93,
     stall_timeout_s: Optional[float] = None,
     hard_timeout_s: Optional[float] = None,
+    throughput_warmup_epochs: int = 8,
+    throughput_collapse_factor: float = 5.0,
 ) -> None:
     """Spawn a subprocess, stream stdout line-by-line, and (for tagged
     training invocations) parse per-epoch progress into `training_progress`
@@ -160,6 +190,13 @@ def _run(
     if no `training_progress` line arrives within that window. When
     `hard_timeout_s` is set, raise `SubprocessTimeout` after that total
     wall-clock duration.
+
+    Throughput-collapse detection (training only): the first
+    `throughput_warmup_epochs` epochs establish a per-epoch wall-time
+    baseline (median). After warmup, if the median of the last 3 epoch
+    durations exceeds `throughput_collapse_factor` × baseline, raise
+    `SubprocessThroughputCollapse`. Catches VRAM spillover where epochs
+    still arrive but at 10-100x slower — invisible to `SubprocessStalled`.
     """
     if event_log is not None:
         event_log.log("subprocess_start", tag=tag, cmd=cmd, cwd=str(cwd) if cwd else None)
@@ -198,6 +235,14 @@ def _run(
     last_progress_t = start_t
     poll_tick_s = 2.0
 
+    # Per-epoch wall-time tracking for throughput-collapse detection.
+    # `epoch_durations` records the gap between consecutive
+    # training_progress events. The first `throughput_warmup_epochs`
+    # gaps form the baseline median; subsequent gaps are checked
+    # against it.
+    epoch_durations: deque[float] = deque(maxlen=throughput_warmup_epochs + 32)
+    baseline_epoch_s: Optional[float] = None
+
     try:
         while True:
             end_of_stream = False
@@ -216,7 +261,28 @@ def _run(
                     sys.stdout.write(line + "\n")
                     sys.stdout.flush()
                     if tag == "train_diffusion" and _EPOCH_RE.search(line):
-                        last_progress_t = time.time()
+                        now_t = time.time()
+                        gap = now_t - last_progress_t
+                        # Skip the first gap (it includes Python/CUDA
+                        # startup + initial validation pass, not a
+                        # representative epoch). Once warmup fills,
+                        # freeze the baseline.
+                        if last_progress_t != start_t:
+                            epoch_durations.append(gap)
+                        if (
+                            baseline_epoch_s is None
+                            and len(epoch_durations) >= throughput_warmup_epochs
+                        ):
+                            warmup = sorted(list(epoch_durations)[:throughput_warmup_epochs])
+                            baseline_epoch_s = warmup[len(warmup) // 2]
+                            if event_log is not None:
+                                event_log.log(
+                                    "training_throughput_baseline",
+                                    tag=tag,
+                                    baseline_epoch_s=baseline_epoch_s,
+                                    warmup_epochs=throughput_warmup_epochs,
+                                )
+                        last_progress_t = now_t
                     _emit_training_line_events(tag, line, event_log)
 
             # Abort conditions — checked every tick regardless of whether a
@@ -234,6 +300,36 @@ def _run(
                     )
                 _kill_subprocess(proc)
                 raise SubprocessMemoryAbort(tag, summary, last_n)
+
+            # Throughput-collapse: median of the last 3 epoch durations
+            # vs the frozen warmup baseline. Requires baseline +3 fresh
+            # post-warmup epochs so a single slow epoch never trips it.
+            if (
+                tag == "train_diffusion"
+                and baseline_epoch_s is not None
+                and len(epoch_durations) >= throughput_warmup_epochs + 3
+            ):
+                recent = sorted(list(epoch_durations)[-3:])
+                recent_med = recent[len(recent) // 2]
+                ratio = recent_med / baseline_epoch_s if baseline_epoch_s > 0 else 0.0
+                if ratio >= throughput_collapse_factor:
+                    summary = monitor.summary() if monitor is not None else {}
+                    last_n = list(rolling_lines)
+                    if event_log is not None:
+                        event_log.log(
+                            "training_throughput_collapse",
+                            tag=tag,
+                            recent_epoch_s=recent_med,
+                            baseline_epoch_s=baseline_epoch_s,
+                            ratio=ratio,
+                            collapse_factor=throughput_collapse_factor,
+                            summary=summary,
+                            last_lines=last_n,
+                        )
+                    _kill_subprocess(proc)
+                    raise SubprocessThroughputCollapse(
+                        tag, recent_med, baseline_epoch_s, ratio, summary, last_n,
+                    )
 
             if stall_timeout_s and tag == "train_diffusion":
                 gap = time.time() - last_progress_t
@@ -275,9 +371,23 @@ def _run(
         reader.join(timeout=5)
 
     if proc.returncode != 0:
+        last_lines = list(rolling_lines)
         if event_log is not None:
-            event_log.log("subprocess_failed", tag=tag, returncode=proc.returncode)
-        raise subprocess.CalledProcessError(proc.returncode, cmd)
+            event_log.log(
+                "subprocess_failed",
+                tag=tag,
+                returncode=proc.returncode,
+                last_lines=last_lines,
+            )
+        err = subprocess.CalledProcessError(proc.returncode, cmd)
+        # Stash the tail of stdout so retrain_cumulative's exception
+        # handler can surface the actual error (RuntimeError, OOM,
+        # shape-mismatch, etc.) rather than just `CalledProcessError(...)`.
+        # This is what the advisor reads back from event history to
+        # decide what to try next.
+        err.last_lines = last_lines  # type: ignore[attr-defined]
+        err.tag = tag  # type: ignore[attr-defined]
+        raise err
 
     if event_log is not None:
         event_log.log("subprocess_done", tag=tag)
@@ -469,9 +579,30 @@ def train(
     ]
     _forward_training_hparams(cfg, cmd)
 
+    # Cap PyTorch's allocator at cfg.gpu.memory_fraction (default 0.95)
+    # so an over-large allocation OOMs cleanly instead of silently
+    # spilling to host-shared memory and collapsing throughput.
+    gpu_cfg = getattr(cfg, "gpu", None)
+    mem_fraction = float(getattr(gpu_cfg, "memory_fraction", 0.95)) if gpu_cfg else 0.95
+    cmd.extend(["--gpu-mem-fraction", str(mem_fraction)])
+
     early_stop = int(getattr(cfg.cadence, "early_stop_patience", 0) or 0)
     if early_stop > 0:
         cmd.extend(["--early-stop-patience", str(early_stop)])
+
+    # Live training previews — point train_diffusion at the dashboard's
+    # examples_<session> dir so it writes inference samples there every
+    # `cadence.train_preview_every_epochs` epochs. Set to 0 (or no
+    # event_log session) to disable. This is purely a visual feedback
+    # channel for the operator; rendering is wrapped in try/except on
+    # the trainer side so it can't break a retrain.
+    preview_every = int(getattr(cfg.cadence, "train_preview_every_epochs", 5) or 0)
+    if preview_every > 0 and event_log is not None and getattr(event_log, "session", None):
+        examples_dir = Path(cfg.paths.runs_dir) / f"examples_{event_log.session}"
+        cmd.extend([
+            "--preview-dir", str(examples_dir),
+            "--preview-every", str(preview_every),
+        ])
 
     if resume_checkpoint is not None:
         cmd.extend(["--fine-tune", str(resume_checkpoint)])
@@ -486,7 +617,6 @@ def train(
     # GPU monitor: poll nvidia-smi, abort on sustained VRAM pressure or
     # on training_progress stall. Thresholds are read from cfg.gpu with
     # conservative defaults tuned for a 32 GB RTX 5090.
-    gpu_cfg = getattr(cfg, "gpu", None)
     abort_frac = float(getattr(gpu_cfg, "memory_abort_frac", 0.93)) if gpu_cfg else 0.93
     warn_frac = float(getattr(gpu_cfg, "memory_warn_frac", 0.85)) if gpu_cfg else 0.85
     sample_interval_s = float(getattr(gpu_cfg, "sample_interval_s", 5.0)) if gpu_cfg else 5.0
@@ -578,6 +708,7 @@ def retrain_cumulative(
     resume_checkpoint: str | Path | None,
     epochs: int,
     locked_val_dataset: str | Path | None = None,
+    wide_verify_canvas_dirs: list[str | Path] | None = None,
     event_log=None,
 ) -> dict | None:
     """Cumulative retrain used by the comparison experiment.
@@ -668,6 +799,51 @@ def retrain_cumulative(
                 Path(cfg.paths.runs_dir) / f"eval_locked_elbow_{stamp}",
                 event_log=event_log,
             )
+
+        # Wide-verify corpus eval — held-out generalization signal that
+        # grows over the run's lifetime. Combine all accumulated wide-
+        # verify canvas dirs into a temp corpus, evaluate the candidate
+        # against it, return MSE. Skipped silently when the corpus is
+        # empty (cold-start cycles before any wide-verify has run).
+        wide_verify_mse = None
+        wv_dirs = [Path(p) for p in (wide_verify_canvas_dirs or [])]
+        wv_dirs = [d for d in wv_dirs if d.exists()]
+        if wv_dirs:
+            wv_corpus_dir = (
+                Path(cfg.paths.runs_dir) / f"wide_verify_corpus_{stamp}"
+            )
+            if wv_corpus_dir.exists():
+                shutil.rmtree(wv_corpus_dir)
+            try:
+                if len(wv_dirs) == 1:
+                    shutil.copytree(wv_dirs[0], wv_corpus_dir)
+                else:
+                    combine_datasets(
+                        cfg, wv_dirs, wv_corpus_dir, event_log=event_log,
+                    )
+                eval_out_wv = (
+                    Path(cfg.paths.runs_dir) / f"eval_wide_verify_{stamp}"
+                )
+                wide_verify_mse = evaluate(
+                    cfg, new_ckpt, wv_corpus_dir, eval_out_wv,
+                    event_log=event_log,
+                )
+            except Exception as e:
+                if event_log is not None:
+                    event_log.log(
+                        "wide_verify_eval_failed",
+                        error=str(e),
+                        n_dirs=len(wv_dirs),
+                    )
+            finally:
+                # The combined corpus is recomputable from the source
+                # dirs every retrain — no value in keeping the
+                # transient combined output around.
+                if wv_corpus_dir.exists():
+                    try:
+                        shutil.rmtree(wv_corpus_dir)
+                    except OSError:
+                        pass
     except SubprocessMemoryAbort as e:
         return {
             "memory_abort": True,
@@ -683,6 +859,16 @@ def retrain_cumulative(
             "summary": e.summary,
             "last_lines": e.last_lines,
         }
+    except SubprocessThroughputCollapse as e:
+        return {
+            "throughput_collapse": True,
+            "tag": e.tag,
+            "recent_epoch_s": e.recent_epoch_s,
+            "baseline_epoch_s": e.baseline_epoch_s,
+            "ratio": e.ratio,
+            "summary": e.summary,
+            "last_lines": e.last_lines,
+        }
     except SubprocessTimeout as e:
         return {
             "timeout": True,
@@ -690,9 +876,28 @@ def retrain_cumulative(
             "timeout_s": e.timeout_s,
         }
     except Exception as e:
+        # Generic crash (CalledProcessError from a bad arg combo, a
+        # RuntimeError mid-training such as a patch_size that doesn't
+        # divide canvas dims, etc.). Recoverable from the orchestrator's
+        # POV — it routes back to THINK so the advisor sees the error
+        # in events history and can pick different params next cycle.
+        last_lines = list(getattr(e, "last_lines", []) or [])
+        tag = getattr(e, "tag", None)
         if event_log is not None:
-            event_log.log("retrain_exception", error=str(e))
-        return None
+            event_log.log(
+                "retrain_exception",
+                error=str(e),
+                error_type=type(e).__name__,
+                tag=tag,
+                last_lines=last_lines,
+            )
+        return {
+            "crashed": True,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "tag": tag,
+            "last_lines": last_lines,
+        }
 
     if train_val_mse is None:
         if event_log is not None:
@@ -708,6 +913,8 @@ def retrain_cumulative(
             locked_val_mse=locked_val_mse,
             locked_val_shoulder=locked_val_shoulder,
             locked_val_elbow=locked_val_elbow,
+            wide_verify_mse=wide_verify_mse,
+            wide_verify_corpus_size=len(wv_dirs),
             per_cell_mse_joints=(
                 sorted(per_cell_mse.keys()) if per_cell_mse else None
             ),
@@ -722,6 +929,8 @@ def retrain_cumulative(
         "locked_val_mse": locked_val_mse,
         "locked_val_shoulder": locked_val_shoulder,
         "locked_val_elbow": locked_val_elbow,
+        "wide_verify_mse": wide_verify_mse,
+        "wide_verify_corpus_size": len(wv_dirs),
         "per_cell_mse": per_cell_mse,
     }
 
