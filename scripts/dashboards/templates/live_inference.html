@@ -32,6 +32,18 @@
   .canvas-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
   .empty { color: var(--muted); font-style: italic; font-size: 12px; padding: 20px; text-align: center; }
   kbd { display: inline-block; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 10px; padding: 1px 5px; margin-left: 4px; background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.18); border-radius: 3px; color: inherit; opacity: 0.85; vertical-align: middle; }
+  .bc-prob { display: flex; align-items: center; gap: 6px; margin: 3px 0; font-size: 12px; }
+  .bc-prob .label { width: 50px; text-align: right; color: var(--muted); }
+  .bc-prob .bar-bg { flex: 1; height: 14px; background: #1d2230; border-radius: 3px; overflow: hidden; }
+  .bc-prob .bar { height: 100%; border-radius: 3px; transition: width 0.2s; }
+  .bc-prob .bar.move-pos { background: #2e9a4f; }
+  .bc-prob .bar.move-neg { background: #4488dd; }
+  .bc-prob .bar.stay { background: #cc4444; }
+  .bc-prob .bar.winner { box-shadow: 0 0 6px rgba(255,255,255,0.3); }
+  .bc-prob .val { width: 45px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; }
+  .bc-action { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+  .bc-auto-active { background: #b35a2e !important; animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: 0.7; } }
 </style></head><body>
 
 <header>
@@ -74,6 +86,16 @@
     <div class="row">
       <button class="warn" id="btn-relax" title="Relax joints (R)">Relax joints <kbd>R</kbd></button>
       <button class="primary" id="btn-lock" title="Lock joints (L)">Lock joints <kbd>L</kbd></button>
+    </div>
+
+    <div id="bc-controls" style="display:none;">
+      <label style="margin-top: 18px;">BC Policy</label>
+      <div class="row">
+        <button class="primary" id="btn-bc-predict" title="BC Predict (B)">BC Predict <kbd>B</kbd></button>
+        <button class="primary" id="btn-bc-step" title="BC Step (N)">BC Step <kbd>N</kbd></button>
+        <button class="muted" id="btn-bc-auto" title="BC Auto (A)">BC Auto <kbd>A</kbd></button>
+      </div>
+      <div id="bc-result" style="margin-top: 8px;"></div>
     </div>
   </div>
 
@@ -334,5 +356,97 @@ document.addEventListener("keydown", (ev) => {
   ev.preventDefault();
   btn.click();
 });
+
+// ---- BC Policy controls ----
+const BC_ENABLED = __BC_ENABLED__;
+if (BC_ENABLED) {
+  document.getElementById("bc-controls").style.display = "block";
+}
+
+const ACTION_COLORS = {"move+": "move-pos", "move-": "move-neg", "stay": "stay"};
+
+function renderBCResult(res) {
+  const el = document.getElementById("bc-result");
+  const probs = res.probabilities || {};
+  let html = '<div class="bc-action">→ ' + res.action_name + ' (' + (res.confidence * 100).toFixed(1) + '%)</div>';
+  for (const [name, p] of Object.entries(probs)) {
+    const pct = (p * 100).toFixed(1);
+    const isWinner = name === res.action_name;
+    html += '<div class="bc-prob">' +
+      '<span class="label">' + name + '</span>' +
+      '<div class="bar-bg"><div class="bar ' + ACTION_COLORS[name] + (isWinner ? ' winner' : '') + '" style="width:' + pct + '%"></div></div>' +
+      '<span class="val">' + pct + '%</span></div>';
+  }
+  el.innerHTML = html;
+}
+
+document.getElementById("btn-bc-predict").addEventListener("click", async () => {
+  setStatus("BC predicting...", "");
+  const btn = document.getElementById("btn-bc-predict");
+  btn.disabled = true;
+  try {
+    const res = await postJSON("/api/bc_predict", {});
+    renderBCResult(res);
+    setStatus("BC: " + res.action_name + " (" + (res.confidence * 100).toFixed(1) + "%)", "ok");
+  } catch (e) {
+    setStatus("BC predict failed: " + e.message, "err");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById("btn-bc-step").addEventListener("click", async () => {
+  setStatus("BC stepping...", "");
+  const btn = document.getElementById("btn-bc-step");
+  btn.disabled = true;
+  try {
+    const res = await postJSON("/api/bc_step", {});
+    renderBCResult(res);
+    setBeforeTs(null);
+    setStatus("BC step: " + res.action_name + " executed", "ok");
+  } catch (e) {
+    setStatus("BC step failed: " + e.message, "err");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+let bcAutoInterval = null;
+document.getElementById("btn-bc-auto").addEventListener("click", async () => {
+  const btn = document.getElementById("btn-bc-auto");
+  if (bcAutoInterval) {
+    clearInterval(bcAutoInterval);
+    bcAutoInterval = null;
+    btn.classList.remove("bc-auto-active");
+    btn.textContent = "BC Auto";
+    await postJSON("/api/bc_auto", {running: false}).catch(() => {});
+    setStatus("BC auto stopped.", "ok");
+    return;
+  }
+  btn.classList.add("bc-auto-active");
+  btn.textContent = "⏹ Stop Auto";
+  await postJSON("/api/bc_auto", {running: true}).catch(() => {});
+  setStatus("BC auto running...", "ok");
+  async function step() {
+    try {
+      const res = await postJSON("/api/bc_step", {});
+      renderBCResult(res);
+      setStatus("BC auto: " + res.action_name + " (" + (res.confidence * 100).toFixed(1) + "%)", "ok");
+    } catch (e) {
+      setStatus("BC auto error: " + e.message, "err");
+      clearInterval(bcAutoInterval);
+      bcAutoInterval = null;
+      btn.classList.remove("bc-auto-active");
+      btn.textContent = "BC Auto";
+    }
+  }
+  step();
+  bcAutoInterval = setInterval(step, 2000);
+});
+
+// Add BC keyboard shortcuts
+KEY_TO_BUTTON["b"] = "btn-bc-predict";
+KEY_TO_BUTTON["n"] = "btn-bc-step";
+KEY_TO_BUTTON["a"] = "btn-bc-auto";
 </script>
 </body></html>

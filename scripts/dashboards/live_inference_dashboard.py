@@ -14,6 +14,15 @@ physical SO-101 arm. Serves:
     by hand.
   - "Lock joints": re-enables torque holding the current pose.
 
+BC policy mode (--bc-checkpoint): loads a trained BC policy (ResNet-18)
+from canvas-bc-distill. The dashboard adds:
+
+  - "BC Predict": captures the current camera frame, runs the BC policy,
+    and shows the predicted action + per-class probabilities.
+  - "BC Step": predicts an action with the BC policy AND executes it on
+    the robot in one click — closed-loop testing.
+  - "BC Auto": runs BC Step in a loop at ~1 Hz for hands-free evaluation.
+
 Cameras are only read on demand (Predict / Execute click). There is no
 continuous MJPEG feed — that was causing camera-enumeration conflicts
 when restarting the dashboard.
@@ -25,6 +34,8 @@ access on Windows.
 Usage:
     python scripts/live_inference_dashboard.py --config configs/default.yaml
     python scripts/live_inference_dashboard.py --config configs/default.yaml --dry-run --port 8766
+    python scripts/live_inference_dashboard.py --config configs/default.yaml \\
+        --bc-checkpoint C:/Projects/canvas-bc-distill/checkpoints/bc_red_kong_2k/best.pt
 """
 
 from __future__ import annotations
@@ -49,6 +60,11 @@ from PIL import Image
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+# canvas-bc-distill lives next to canvas-autonomous-learner.
+BC_DISTILL_ROOT = REPO_ROOT.parent / "canvas-bc-distill"
+if BC_DISTILL_ROOT.exists():
+    sys.path.insert(0, str(BC_DISTILL_ROOT))
+
 from learner.config import load_config  # noqa: E402
 from learner.hardware import Hardware  # noqa: E402
 from learner.registry import Registry  # noqa: E402
@@ -68,6 +84,9 @@ class DashboardState:
     canvas_tokens: dict = field(default_factory=dict)  # token -> Path
     active_model: str = ""  # option key from `_build_model_options`
     active_checkpoint: Optional[str] = None  # path of currently loaded model
+    bc_policy: Optional[object] = None  # BCPolicy model, if loaded
+    bc_device: str = "cpu"
+    bc_auto_running: bool = False
 
     def clear_before(self) -> None:
         self.before_motor = None
@@ -464,6 +483,7 @@ def make_handler(
             .replace("__MODEL_OPTIONS__", json.dumps(_options()))
             .replace("__INITIAL_MODEL_KEY__", state.active_model)
             .replace("__INITIAL_MODEL_CKPT__", state.active_checkpoint or "")
+            .replace("__BC_ENABLED__", "true" if state.bc_policy is not None else "false")
             .encode("utf-8")
         )
 
@@ -585,6 +605,12 @@ def make_handler(
                                           "motor_state": motor.tolist()})
                 elif path == "/api/set_model":
                     self._send_json(200, self._api_set_model(self._read_json()))
+                elif path == "/api/bc_predict":
+                    self._send_json(200, self._api_bc_predict())
+                elif path == "/api/bc_step":
+                    self._send_json(200, self._api_bc_step())
+                elif path == "/api/bc_auto":
+                    self._send_json(200, self._api_bc_auto(self._read_json()))
                 else:
                     self.send_error(404)
             except Exception as e:
@@ -755,6 +781,61 @@ def make_handler(
                 "action": action,
             }
 
+        # --------------------------------------------- BC policy endpoints
+
+        def _bc_infer(self) -> dict:
+            """Capture frame, run BC policy, return action + probabilities."""
+            if state.bc_policy is None:
+                raise ValueError("no BC policy loaded (start with --bc-checkpoint)")
+            import torch
+            from canvas_bc_distill.actions import CLASS_TO_ACTION, ACTION_NAMES
+            with bus_lock:
+                _cams, motor, ctx = hw.observe()
+            frame = cv2.resize(ctx, (224, 224), interpolation=cv2.INTER_AREA)
+            tensor = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0)
+            tensor = tensor.to(state.bc_device)
+            with torch.no_grad():
+                logits = state.bc_policy(tensor)
+                probs = torch.softmax(logits, dim=1)[0]
+            pred_class = int(probs.argmax())
+            action = CLASS_TO_ACTION[pred_class]
+            prob_dict = {
+                ACTION_NAMES[CLASS_TO_ACTION[i]]: round(float(probs[i]), 4)
+                for i in range(len(probs))
+            }
+            return {
+                "action": action,
+                "action_name": ACTION_NAMES[action],
+                "probabilities": prob_dict,
+                "confidence": round(float(probs[pred_class]), 4),
+                "motor_state": motor.tolist(),
+            }
+
+        def _api_bc_predict(self) -> dict:
+            return self._bc_infer()
+
+        def _api_bc_step(self) -> dict:
+            result = self._bc_infer()
+            action = result["action"]
+            joint = cfg.robot.control_joint
+            joint_idx = JOINTS.index(joint)
+            with bus_lock:
+                if not state.torque_on:
+                    hw.lock()
+                    state.torque_on = True
+                hw.execute(action)
+                _wait_until_motion_settled(hw)
+                hw.observe()  # flush stale frame
+                _cams, motor_after, ctx_after = hw.observe()
+            result["motor_after"] = motor_after.tolist()
+            result["joint"] = joint
+            return result
+
+        def _api_bc_auto(self, body: dict) -> dict:
+            running = body.get("running", False)
+            state.bc_auto_running = bool(running)
+            return {"bc_auto_running": state.bc_auto_running}
+
     return Handler
 
 
@@ -767,7 +848,8 @@ class _ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def serve(cfg_path: Path, port: int, host: str, dry_run: bool,
-          baseline_checkpoint: Optional[str] = None) -> None:
+          baseline_checkpoint: Optional[str] = None,
+          bc_checkpoint: Optional[str] = None) -> None:
     cfg = load_config(cfg_path)
     registry = Registry(cfg.paths.registry_file)
     ckpt = registry.live_checkpoint()
@@ -826,6 +908,15 @@ def serve(cfg_path: Path, port: int, host: str, dry_run: bool,
         marker = "*" if o["key"] == initial_key else " "
         print(f"   {marker} {o['key']}: {o['label']}")
 
+    if bc_checkpoint:
+        import torch
+        from canvas_bc_distill.policy.model import load_for_inference
+        bc_device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"  loading BC policy: {bc_checkpoint} (device={bc_device})")
+        state.bc_policy = load_for_inference(bc_checkpoint, device=bc_device)
+        state.bc_device = bc_device
+        print(f"  BC policy loaded.")
+
     mode = "dry-run" if dry_run else "hardware"
     handler = make_handler(
         hw=hw, cfg=cfg, registry=registry,
@@ -867,10 +958,22 @@ def main() -> int:
             "checkpoint and this baseline."
         ),
     )
+    p.add_argument(
+        "--bc-checkpoint",
+        default=None,
+        help=(
+            "Path to a trained BC policy checkpoint (best.pt from "
+            "canvas-bc-distill). Enables BC Predict / BC Step / BC Auto "
+            "controls in the dashboard."
+        ),
+    )
     args = p.parse_args()
+    if args.bc_checkpoint and not Path(args.bc_checkpoint).exists():
+        raise SystemExit(f"--bc-checkpoint does not exist: {args.bc_checkpoint}")
     serve(
         Path(args.config).resolve(), args.port, args.host, args.dry_run,
         baseline_checkpoint=args.baseline_checkpoint,
+        bc_checkpoint=args.bc_checkpoint,
     )
     return 0
 
